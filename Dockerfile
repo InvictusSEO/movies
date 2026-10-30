@@ -1,15 +1,13 @@
-# Използваме официален Node.js образ
-FROM node:20-slim
-
-# Инсталираме Playwright и му казваме сам да свали браузърите и зависимостите
-RUN apt-get update && apt-get install -y \
-    && npx playwright install --with-deps chromium
+# Използваме официалния образ, в който вече има Chrome и всички библиотеки
+FROM mcr.microsoft.com/playwright:latest
 
 WORKDIR /app
 
+# Копираме файловете и инсталираме Node.js зависимостите
 COPY package*.json ./
 RUN npm install
 
+# Копираме останалия код
 COPY . .
 
 EXPOSE 3000
