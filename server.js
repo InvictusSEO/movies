@@ -18,30 +18,32 @@ app.get('/check', async (req, res) => {
         
         let hlsUrl = null;
 
-        // 1. Прихващаме ВСИЧКИ мрежови заявки
-        await page.route('**/*', (route) => {
-            const reqUrl = route.request().url();
-            if (reqUrl.includes('.m3u8')) {
-                hlsUrl = reqUrl;
+        // 1. Следим ВСИЧКИ мрежови отговори (включително от iframe)
+        page.on('response', (response) => {
+            const respUrl = response.url();
+            if (respUrl.includes('.m3u8') && !hlsUrl) {
+                hlsUrl = respUrl;
                 console.log('🎯 Открит HLS линк:', hlsUrl);
             }
-            route.continue();
         });
 
         // 2. Отваряме сайта
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // 3. Изчакваме 7 секунди за видеото
-        await page.waitForTimeout(7000);
-
-        // 4. Ако все още нямаме HLS, изчакваме още малко
-        if (!hlsUrl) {
-            await page.waitForResponse((resp) => resp.url().includes('.m3u8'), { timeout: 5000 }).catch(() => {});
+        // 3. Изчакваме до 22 секунди за видеото (според документацията на VidCore)
+        const startTime = Date.now();
+        while (!hlsUrl && (Date.now() - startTime) < 22000) {
+            await page.waitForTimeout(1000);
         }
 
+        // 4. Извличаме заглавието и текста
         const title = await page.title();
         const bodyText = await page.evaluate(() => document.body.innerText);
-        const hasError = bodyText.toLowerCase().includes('not found') || bodyText.toLowerCase().includes('not available');
+        
+        // 5. Проверяваме за съобщение за грешка (фалшив ID)
+        const hasError = bodyText.toLowerCase().includes('not found') || 
+                        bodyText.toLowerCase().includes('not available') ||
+                        bodyText.toLowerCase().includes('no streams are available');
 
         await browser.close();
 
@@ -49,10 +51,10 @@ app.get('/check', async (req, res) => {
             success: true,
             url: url,
             title: title,
-            hasM3u8: !!hlsUrl, // true ако сме намерили .m3u8
+            hasM3u8: !!hlsUrl,
             hlsUrl: hlsUrl,
             hasError: hasError,
-            snippet: bodyText.substring(0, 150)
+            snippet: bodyText.substring(0, 200)
         });
 
     } catch (error) {
