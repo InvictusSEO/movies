@@ -1,5 +1,5 @@
 # Използваме официален Playwright образ, който поддържа ARM64
-FROM mcr.microsoft.com/playwright:v1.46.1-jammy
+FROM mcr.microsoft.com/playwright:v1.64.1-jammy
 
 # Създаваме папка за приложението
 WORKDIR /app
