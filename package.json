@@ -6,7 +6,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "playwright": "^1.64.1"
+    "express": "latest",
+    "playwright": "latest",
+    "playwright-extra": "latest",
+    "puppeteer-extra-plugin-stealth": "latest"
   }
 }
