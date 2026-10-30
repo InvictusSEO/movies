@@ -1,5 +1,10 @@
 const express = require('express');
-const { chromium } = require('playwright');
+// Използваме playwright-extra вместо стандартния playwright
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
+
+// Активираме Stealth режима (прави браузъра невидим за Cloudflare)
+chromium.use(stealth);
 
 const app = express();
 app.use(express.json());
@@ -10,18 +15,20 @@ app.get('/check', async (req, res) => {
 
     let browser;
     try {
-        // Стартираме скрит браузър
+        // Стартираме скрития браузър
         browser = await chromium.launch({ headless: true });
         const page = await browser.newPage();
         
-        // Отваряме сайта и изчакваме да се зареди мрежата
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
+        // Отваряме сайта
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
         
         // Извличаме заглавието и текста
         const title = await page.title();
         const bodyText = await page.evaluate(() => document.body.innerText);
         
-        // Търсим индикатори за видео
+        // Проверяваме дали Cloudflare все още ни блокира
+        const isCloudflare = title.includes('Attention Required') || bodyText.includes('you have been blocked');
+        
         const hasM3u8 = bodyText.includes('.m3u8') || (await page.content()).includes('.m3u8');
         const hasError = bodyText.toLowerCase().includes('not found') || bodyText.toLowerCase().includes('not available');
 
@@ -33,7 +40,8 @@ app.get('/check', async (req, res) => {
             title: title,
             hasM3u8: hasM3u8,
             hasError: hasError,
-            snippet: bodyText.substring(0, 200)
+            isCloudflare: isCloudflare,
+            snippet: bodyText.substring(0, 150) // Показваме само първите 150 символа
         });
 
     } catch (error) {
