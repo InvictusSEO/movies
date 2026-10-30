@@ -1,18 +1,16 @@
-# Използваме официален Playwright образ, който поддържа ARM64
-FROM mcr.microsoft.com/playwright:v1.64.1-jammy
+# Използваме официален Node.js образ
+FROM node:20-slim
 
-# Създаваме папка за приложението
+# Инсталираме Playwright и му казваме сам да свали браузърите и зависимостите
+RUN apt-get update && apt-get install -y \
+    && npx playwright install --with-deps chromium
+
 WORKDIR /app
 
-# Копираме package.json и инсталираме зависимостите
 COPY package*.json ./
 RUN npm install
 
-# Копираме останалите файлове
 COPY . .
 
-# Отваряме порт 3000
 EXPOSE 3000
-
-# Стартираме сървъра
 CMD ["npm", "start"]
