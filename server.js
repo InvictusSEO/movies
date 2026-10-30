@@ -13,37 +13,56 @@ app.get('/check', async (req, res) => {
 
     let browser;
     try {
-        browser = await chromium.launch({ headless: true });
+        // 1. Стартираме с флагове за прикриване на бота
+        browser = await chromium.launch({ 
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled'
+            ]
+        });
         const page = await browser.newPage();
         
         let hlsUrl = null;
 
-        // 1. Следим ВСИЧКИ мрежови отговори (включително от iframe)
+        // 2. Следим мрежовите заявки
         page.on('response', (response) => {
             const respUrl = response.url();
-            if (respUrl.includes('.m3u8') && !hlsUrl) {
+            if ((respUrl.includes('.m3u8') || respUrl.includes('/proxy/')) && !hlsUrl) {
                 hlsUrl = respUrl;
-                console.log('🎯 Открит HLS линк:', hlsUrl);
             }
         });
 
-        // 2. Отваряме сайта
+        // 3. Отваряме сайта
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // 3. Изчакваме до 22 секунди за видеото (според документацията на VidCore)
+        // 4. Изчакваме 4 секунди, за да се зареди интерфейса
+        await page.waitForTimeout(4000);
+
+        // 5. Опитваме да намерим и кликнем върху бутона за стартиране на сървъра
+        try {
+            const playButton = await page.$('button:has-text("Play"), button:has-text("Server"), [class*="play"]');
+            if (playButton) {
+                await playButton.click();
+                console.log('✅ Кликнахме върху бутона за стартиране на сървъра');
+            }
+        } catch (e) {
+            console.log('⚠️ Не намерихме бутон за кликване, продължаваме да чакаме...');
+        }
+
+        // 6. Изчакваме до 15 секунди за видеото
         const startTime = Date.now();
-        while (!hlsUrl && (Date.now() - startTime) < 22000) {
+        while (!hlsUrl && (Date.now() - startTime) < 15000) {
             await page.waitForTimeout(1000);
         }
 
-        // 4. Извличаме заглавието и текста
+        // 7. Извличаме заглавието и текста
         const title = await page.title();
         const bodyText = await page.evaluate(() => document.body.innerText);
         
-        // 5. Проверяваме за съобщение за грешка (фалшив ID)
         const hasError = bodyText.toLowerCase().includes('not found') || 
-                        bodyText.toLowerCase().includes('not available') ||
-                        bodyText.toLowerCase().includes('no streams are available');
+                        bodyText.toLowerCase().includes('not available');
 
         await browser.close();
 
