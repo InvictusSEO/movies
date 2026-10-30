@@ -1,13 +1,10 @@
-# Използваме официалния образ, в който вече има Chrome и всички библиотеки
-FROM mcr.microsoft.com/playwright:latest
+FROM mcr.microsoft.com/playwright:v1.64.1-jammy
 
 WORKDIR /app
 
-# Копираме файловете и инсталираме Node.js зависимостите
 COPY package*.json ./
 RUN npm install
 
-# Копираме останалия код
 COPY . .
 
 EXPOSE 3000
