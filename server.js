@@ -2,7 +2,6 @@ const express = require('express');
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 
-// Активираме Stealth режима (прави браузъра невидим за Cloudflare)
 chromium.use(stealth);
 
 const app = express();
@@ -17,23 +16,31 @@ app.get('/check', async (req, res) => {
         browser = await chromium.launch({ headless: true });
         const page = await browser.newPage();
         
-        // 1. Отваряме сайта и чакаме мрежата да утихне
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-        
-        // 2. ДОБАВЕНО: Изчакваме допълнително 5 секунди за динамично съдържание
-        await page.waitForTimeout(5000);
-        
-        // 3. Извличаме заглавието и текста
-        const title = await page.title();
-        let bodyText = await page.evaluate(() => document.body.innerText);
-        
-        // 4. ДОБАВЕНО: Ако все още пише "FETCHING", изчакваме още малко
-        if (bodyText.includes('FETCHING YOUR CONTENT')) {
-            await page.waitForTimeout(3000);
-            bodyText = await page.evaluate(() => document.body.innerText);
+        let hlsUrl = null;
+
+        // 1. Прихващаме ВСИЧКИ мрежови заявки
+        await page.route('**/*', (route) => {
+            const reqUrl = route.request().url();
+            if (reqUrl.includes('.m3u8')) {
+                hlsUrl = reqUrl;
+                console.log('🎯 Открит HLS линк:', hlsUrl);
+            }
+            route.continue();
+        });
+
+        // 2. Отваряме сайта
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        // 3. Изчакваме 7 секунди за видеото
+        await page.waitForTimeout(7000);
+
+        // 4. Ако все още нямаме HLS, изчакваме още малко
+        if (!hlsUrl) {
+            await page.waitForResponse((resp) => resp.url().includes('.m3u8'), { timeout: 5000 }).catch(() => {});
         }
 
-        const hasM3u8 = bodyText.includes('.m3u8') || (await page.content()).includes('.m3u8');
+        const title = await page.title();
+        const bodyText = await page.evaluate(() => document.body.innerText);
         const hasError = bodyText.toLowerCase().includes('not found') || bodyText.toLowerCase().includes('not available');
 
         await browser.close();
@@ -42,9 +49,10 @@ app.get('/check', async (req, res) => {
             success: true,
             url: url,
             title: title,
-            hasM3u8: hasM3u8,
+            hasM3u8: !!hlsUrl, // true ако сме намерили .m3u8
+            hlsUrl: hlsUrl,
             hasError: hasError,
-            snippet: bodyText.substring(0, 200) // Показваме първите 200 символа
+            snippet: bodyText.substring(0, 150)
         });
 
     } catch (error) {
