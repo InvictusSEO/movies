@@ -1,5 +1,4 @@
 const express = require('express');
-// Използваме playwright-extra вместо стандартния playwright
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 
@@ -15,20 +14,25 @@ app.get('/check', async (req, res) => {
 
     let browser;
     try {
-        // Стартираме скрития браузър
         browser = await chromium.launch({ headless: true });
         const page = await browser.newPage();
         
-        // Отваряме сайта
+        // 1. Отваряме сайта и чакаме мрежата да утихне
         await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
         
-        // Извличаме заглавието и текста
+        // 2. ДОБАВЕНО: Изчакваме допълнително 5 секунди за динамично съдържание
+        await page.waitForTimeout(5000);
+        
+        // 3. Извличаме заглавието и текста
         const title = await page.title();
-        const bodyText = await page.evaluate(() => document.body.innerText);
+        let bodyText = await page.evaluate(() => document.body.innerText);
         
-        // Проверяваме дали Cloudflare все още ни блокира
-        const isCloudflare = title.includes('Attention Required') || bodyText.includes('you have been blocked');
-        
+        // 4. ДОБАВЕНО: Ако все още пише "FETCHING", изчакваме още малко
+        if (bodyText.includes('FETCHING YOUR CONTENT')) {
+            await page.waitForTimeout(3000);
+            bodyText = await page.evaluate(() => document.body.innerText);
+        }
+
         const hasM3u8 = bodyText.includes('.m3u8') || (await page.content()).includes('.m3u8');
         const hasError = bodyText.toLowerCase().includes('not found') || bodyText.toLowerCase().includes('not available');
 
@@ -40,8 +44,7 @@ app.get('/check', async (req, res) => {
             title: title,
             hasM3u8: hasM3u8,
             hasError: hasError,
-            isCloudflare: isCloudflare,
-            snippet: bodyText.substring(0, 150) // Показваме само първите 150 символа
+            snippet: bodyText.substring(0, 200) // Показваме първите 200 символа
         });
 
     } catch (error) {
