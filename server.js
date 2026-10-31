@@ -233,6 +233,7 @@ const PLAY_SELECTORS = [
 ];
 
 async function tryPlay(page) {
+    let target = null;
     for (const f of page.frames()) {
         try {
             await f.evaluate(() => {
@@ -246,12 +247,40 @@ async function tryPlay(page) {
         for (const sel of PLAY_SELECTORS) {
             try {
                 const el = await f.$(sel);
-                if (el && (await el.isVisible())) { await el.click({ timeout: 1500 }); return true; }
+                if (el && (await el.isVisible())) {
+                    await el.click({ timeout: 1500 });
+                    return (f === page.mainFrame() ? 'main' : f.url().slice(0, 60)) + ' ' + sel;
+                }
             } catch { /* ignore */ }
         }
     }
-    try { await page.mouse.click(640, 360); } catch { /* ignore */ }
-    return false;
+    try { await page.mouse.click(640, 360); target = 'център (640,360)'; } catch { /* ignore */ }
+    return target;
+}
+
+// Видимите елементи, които приличат на бутони: за да се види къде реално може да се кликне.
+async function listClickables(page) {
+    const out = [];
+    for (const f of page.frames()) {
+        try {
+            const items = await f.evaluate(() => {
+                const sel = 'button,[role=button],a,[onclick],[class*="play" i],[id*="play" i],[class*="server" i],[aria-label],svg,video';
+                return Array.from(document.querySelectorAll(sel)).slice(0, 600).map((e) => {
+                    const r = e.getBoundingClientRect();
+                    const cs = getComputedStyle(e);
+                    const cls = typeof e.className === 'string' ? e.className : ((e.className && e.className.baseVal) || '');
+                    return {
+                        tag: e.tagName.toLowerCase(), id: e.id || '', cls: cls.slice(0, 80),
+                        label: (e.getAttribute('aria-label') || '').slice(0, 40), text: (e.innerText || '').trim().slice(0, 30),
+                        x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+                        vis: r.width > 10 && r.height > 10 && cs.visibility !== 'hidden' && cs.display !== 'none',
+                    };
+                }).filter((i) => i.vis).slice(0, 40);
+            });
+            if (items.length) out.push({ frame: f === page.mainFrame() ? 'main' : f.url().slice(0, 100), items });
+        } catch { /* ignore */ }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------- основната проверка
@@ -267,6 +296,10 @@ async function analyze(rawUrl, opts) {
     const netLog = [];
     const failed = [];
     const consoleErrors = [];
+    const allReq = [];
+    const sockets = [];
+    const clickLog = [];
+    let popupsClosed = 0;
     let firstFoundAt = 0;
 
     try {
@@ -281,7 +314,13 @@ async function analyze(rawUrl, opts) {
         }
 
         const page = await context.newPage();
-        context.on('page', (p) => { if (p !== page) p.close().catch(() => {}); });   // рекламни прозорци
+        context.on('page', (p) => { if (p !== page) { popupsClosed++; p.close().catch(() => {}); } });   // рекламни прозорци
+
+        // Пълен списък на заявките (всички типове), за да се види какво плейърът изобщо прави.
+        context.on('request', (r) => {
+            if (allReq.length < 250) allReq.push(r.resourceType() + ' ' + r.method() + ' ' + r.url().slice(0, 150));
+        });
+        page.on('websocket', (ws) => { if (sockets.length < 10) sockets.push(ws.url().slice(0, 160)); });
 
         context.on('requestfailed', (r) => {
             if (failed.length < 40) failed.push({ url: r.url().slice(0, 160), error: (r.failure() || {}).errorText });
@@ -358,14 +397,40 @@ async function analyze(rawUrl, opts) {
             if (bestTime >= 3) break;                                                // видеото върви
 
             const el = Date.now() - start;
-            if (clicks < 4 && el > 2500 && Date.now() - lastClick > 4000) {         // още не върви: пробваме да го стартираме
-                await tryPlay(page);
+            if (clicks < 5 && el > 2500 && Date.now() - lastClick > 2500) {         // още не върви: клик (първият често отваря реклама, вторият пуска плейъра)
+                const target = await tryPlay(page);
+                clickLog.push({ atSec: Math.round(el / 1000), target, popupsClosed });
                 clicks++;
                 lastClick = Date.now();
             }
             if (firstFoundAt && Date.now() - firstFoundAt > 8000) break;             // има манифест, дадохме му време
         }
 
+        // Какво "вижда" сайтът за този браузър: ако много неща изглеждат като автоматизация, плейърът може да спира нарочно.
+        let env = null;
+        if (opts.debug) {
+            env = await page.evaluate(() => {
+                let gl = null;
+                try {
+                    const c = document.createElement('canvas').getContext('webgl');
+                    const ext = c && c.getExtension('WEBGL_debug_renderer_info');
+                    gl = c && ext ? { vendor: c.getParameter(ext.UNMASKED_VENDOR_WEBGL), renderer: c.getParameter(ext.UNMASKED_RENDERER_WEBGL) } : 'няма WebGL';
+                } catch (e) { gl = 'грешка'; }
+                return {
+                    webdriver: navigator.webdriver,
+                    userAgent: navigator.userAgent,
+                    languages: navigator.languages,
+                    plugins: navigator.plugins.length,
+                    chromeObject: !!window.chrome,
+                    hardwareConcurrency: navigator.hardwareConcurrency,
+                    touchPoints: navigator.maxTouchPoints,
+                    screen: screen.width + 'x' + screen.height,
+                    webgl: gl,
+                };
+            }).catch(() => null);
+        }
+
+        const clickables = opts.debug ? await listClickables(page) : null;
         const texts = await frameTexts(page);
         const title = await page.title().catch(() => '');
         const joined = texts.map((t) => t.text).join(' | ');
@@ -437,7 +502,7 @@ async function analyze(rawUrl, opts) {
             candidates: validated.map((v) => ({ kind: v.kind, url: v.url.slice(0, 200), valid: v.valid, why: v.why || null })),
             elapsedMs: Date.now() - t0,
         };
-        if (opts.debug) result.debug = { netLog, failed, consoleErrors };
+        if (opts.debug) result.debug = { netLog, failed, consoleErrors, allRequests: allReq, websockets: sockets, env, clickLog, popupsClosed, clickables };
         if (png) Object.defineProperty(result, '_png', { value: png, enumerable: false });
         return result;
     } finally {
