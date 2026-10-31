@@ -254,8 +254,45 @@ async function tryPlay(page) {
             } catch { /* ignore */ }
         }
     }
+    // Няма познат селектор: търсим голяма иконка/бутон близо до центъра на плейъра (типичният "Play").
+    const spot = await findBigPlay(page);
+    if (spot) {
+        try {
+            await page.mouse.click(spot.x, spot.y);
+            return 'голяма иконка ' + spot.what + ' (' + Math.round(spot.x) + ',' + Math.round(spot.y) + ')';
+        } catch { /* ignore */ }
+    }
     try { await page.mouse.click(640, 360); target = 'център (640,360)'; } catch { /* ignore */ }
     return target;
+}
+
+async function findBigPlay(page) {
+    const vp = page.viewportSize() || { width: 1280, height: 720 };
+    const cx = vp.width / 2;
+    const cy = vp.height / 2;
+    let best = null;
+    for (const f of page.frames()) {
+        let handles = [];
+        try { handles = (await f.$$('svg, button, [role=button], [class*="play" i], [id*="play" i]')).slice(0, 80); } catch { continue; }
+        for (const h of handles) {
+            try {
+                const b = await h.boundingBox();                       // координати спрямо екрана, и за елементи в iframe
+                if (!b) continue;
+                const area = b.width * b.height;
+                if (b.width < 40 || b.height < 40 || area > 250000) continue;
+                const x = b.x + b.width / 2;
+                const y = b.y + b.height / 2;
+                if (x < 0 || y < 0 || x > vp.width || y > vp.height) continue;
+                const dist = Math.hypot(x - cx, y - cy);
+                if (dist > vp.width * 0.4) continue;                      // бутоните по ъглите (меню, лого) не са Play
+                const score = area / (1 + dist / 150);                   // голямо и близо до центъра
+                if (!best || score > best.score) {
+                    best = { x, y, score, what: (await h.evaluate((e) => e.tagName.toLowerCase())) + ' ' + Math.round(b.width) + 'x' + Math.round(b.height) };
+                }
+            } catch { /* ignore */ }
+        }
+    }
+    return best;
 }
 
 // Видимите елементи, които приличат на бутони: за да се види къде реално може да се кликне.
@@ -299,15 +336,17 @@ async function analyze(rawUrl, opts) {
     const allReq = [];
     const sockets = [];
     const clickLog = [];
+    const hijacks = [];
     let popupsClosed = 0;
     let firstFoundAt = 0;
 
     try {
-        if (!ALLOW_PRIVATE) {
+        if (!ALLOW_PRIVATE || opts.block.length) {
             await context.route('**/*', (route) => {
                 try {
-                    const h = new URL(route.request().url()).hostname.replace(/^\[|\]$/g, '');
-                    if (net.isIP(h) && isPrivateIp(h)) return route.abort();
+                    const h = new URL(route.request().url()).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+                    if (!ALLOW_PRIVATE && net.isIP(h) && isPrivateIp(h)) return route.abort();
+                    if (opts.block.some((b) => h === b || h.endsWith('.' + b))) return route.abort();   // ?block=gogtib.com
                 } catch { /* ignore */ }
                 return route.continue();
             });
@@ -362,11 +401,22 @@ async function analyze(rawUrl, opts) {
         });
 
         let navError = null;
+        let guardOn = false;
+        const startHost = new URL(url).hostname;
+        // Ако рекламата пренасочи самата страница към друг сайт, връщаме се.
+        page.on('framenavigated', (fr) => {
+            if (!guardOn || fr !== page.mainFrame()) return;
+            try {
+                const h = new URL(fr.url()).hostname;
+                if (h && h !== startHost) { hijacks.push(fr.url().slice(0, 120)); page.goBack().catch(() => {}); }
+            } catch { /* ignore */ }
+        });
         try {
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         } catch (e) {
             navError = e.message.split('\n')[0];
         }
+        guardOn = true;
 
         let canDecode = null;
         try {
@@ -502,7 +552,7 @@ async function analyze(rawUrl, opts) {
             candidates: validated.map((v) => ({ kind: v.kind, url: v.url.slice(0, 200), valid: v.valid, why: v.why || null })),
             elapsedMs: Date.now() - t0,
         };
-        if (opts.debug) result.debug = { netLog, failed, consoleErrors, allRequests: allReq, websockets: sockets, env, clickLog, popupsClosed, clickables };
+        if (opts.debug) result.debug = { netLog, failed, consoleErrors, allRequests: allReq, websockets: sockets, env, clickLog, popupsClosed, hijacks, clickables };
         if (png) Object.defineProperty(result, '_png', { value: png, enumerable: false });
         return result;
     } finally {
@@ -517,6 +567,7 @@ function parseOpts(q) {
         wait: Math.min(60, Math.max(5, parseInt(q.wait || '30', 10) || 30)),
         runtime: parseFloat(q.runtime || '') || null,
         debug: q.debug === '1',
+        block: String(q.block || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean).slice(0, 20),
     };
 }
 
