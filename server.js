@@ -27,6 +27,32 @@ const CF_RE = /just a moment|verifying you are human|verify you are human|checki
 const LOADING_RE = /fetching|loading|please wait/i;
 const ERROR_RE = /not found|not available|unavailable|no sources?|could not find|couldn.?t find|failed to (load|fetch)|something went wrong|\b404\b/i;
 
+// =====================================================================
+// ДОБАВЕНИ ПРОКСИТА (RESIDENTIAL)
+// =====================================================================
+const PROXY_RAW = [
+    '45.38.107.97:6014:oapkpcio:nc1w33zzouhn',
+    '64.137.96.74:6641:oapkpcio:nc1w33zzouhn',
+    '198.23.243.226:6361:oapkpcio:nc1w33zzouhn',
+    '38.154.185.97:6370:oapkpcio:nc1w33zzouhn',
+    '84.247.60.125:6095:oapkpcio:nc1w33zzouhn',
+    '191.96.254.138:6185:oapkpcio:nc1w33zzouhn',
+    '198.46.161.42:5092:oapkpcio:nc1w33zzouhn',
+    '64.137.10.153:5803:oapkpcio:nc1w33zzouhn',
+    '104.164.49.38:7693:oapkpcio:nc1w33zzouhn',
+    '23.26.71.145:5628:oapkpcio:nc1w33zzouhn'
+];
+
+const PROXIES = PROXY_RAW.map(str => {
+    const parts = str.split(':');
+    return {
+        server: `http://${parts[0]}:${parts[1]}`,
+        username: parts[2],
+        password: parts[3]
+    };
+});
+// =====================================================================
+
 const app = express();
 
 // ---------------------------------------------------------------- сигурност
@@ -325,7 +351,19 @@ async function analyze(rawUrl, opts) {
     const t0 = Date.now();
     const url = (await assertSafeUrl(rawUrl)).href;
     const browser = await getBrowser();
-    const context = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 }, locale: 'en-US', ignoreHTTPSErrors: true });
+    
+    // ИЗБИРАМЕ СЛУЧАЙНО ПРОКСИ ЗА ТАЗИ ЗАЯВКА
+    const proxy = PROXIES[Math.floor(Math.random() * PROXIES.length)];
+    
+    // ДОБАВЯМЕ ПРОКСИТО В КОНТЕКСТА
+    const context = await browser.newContext({ 
+        userAgent: UA, 
+        viewport: { width: 1280, height: 720 }, 
+        locale: 'en-US', 
+        ignoreHTTPSErrors: true,
+        proxy: proxy 
+    });
+    
     const killer = setTimeout(() => context.close().catch(() => {}), 170000);
 
     const found = [];
