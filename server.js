@@ -152,6 +152,102 @@ function durationOk(seconds, runtimeMin) {
     return seconds >= r * 0.6 && seconds <= r * 1.5;
 }
 
+// ---------------------------------------------------------------- качество (резолюция)
+// Етикет по ШИРИНА (широкоекранните филми са напр. 1920x800 и все пак са 1080p), с резервно правило по височина.
+function qualityLabel(w, h) {
+    w = w || 0; h = h || 0;
+    if (!w && !h) return null;
+    if (w >= 3200 || h >= 2000) return '4K';
+    if (w >= 1800 || h >= 1000) return '1080p';
+    if (w >= 1200 || h >= 700) return '720p';
+    if (w >= 800 || h >= 460) return '480p';
+    return 'SD';
+}
+const Q_RANK = { 'SD': 1, '480p': 2, '720p': 3, '1080p': 4, '4K': 5 };
+
+// Най-малък очакван битрейт за заявеното качество. По-ниско от това = подозрително (увеличена картина).
+const Q_MIN_BPS = { '720p': 500000, '1080p': 1200000, '4K': 4000000 };
+
+// Варианти от главен HLS манифест (#EXT-X-STREAM-INF)
+function parseHlsVariants(text, baseUrl) {
+    const lines = text.split(/\r?\n/);
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (!l.startsWith('#EXT-X-STREAM-INF')) continue;
+        const res = /RESOLUTION=(\d+)x(\d+)/i.exec(l);
+        const bw = /(?:^|[:,])BANDWIDTH=(\d+)/i.exec(l);
+        const avg = /AVERAGE-BANDWIDTH=(\d+)/i.exec(l);
+        const uri = lines.slice(i + 1).find((x) => x.trim() && !x.startsWith('#')) || '';
+        let w = res ? +res[1] : 0;
+        let h = res ? +res[2] : 0;
+        let from = res ? 'manifest' : null;
+        if (!res) {
+            // резервно: височината понякога е в името на адреса (…/1080/index.m3u8, …_720p.m3u8)
+            const nm = /(?:^|[\/_\-.])(2160|1440|1080|720|480|360)p?(?=[\/_\-.]|$)/.exec(uri.split('?')[0]);
+            if (nm) { h = +nm[1]; w = Math.round(h * 16 / 9); from = 'manifest-name'; }
+        }
+        out.push({ w, h, bps: avg ? +avg[1] : (bw ? +bw[1] : null), from });
+    }
+    return out;
+}
+
+// Варианти от DASH (.mpd): Representation width/height/bandwidth
+function parseDashVariants(text) {
+    const out = [];
+    const re = /<Representation\b[^>]*>/g;
+    let m;
+    while ((m = re.exec(text))) {
+        const tag = m[0];
+        const w = /\bwidth="(\d+)"/.exec(tag);
+        const h = /\bheight="(\d+)"/.exec(tag);
+        const bw = /\bbandwidth="(\d+)"/.exec(tag);
+        if (w || h) out.push({ w: w ? +w[1] : 0, h: h ? +h[1] : 0, bps: bw ? +bw[1] : null, from: 'manifest' });
+    }
+    if (!out.length) {
+        const mw = /\bmaxWidth="(\d+)"/.exec(text);
+        const mh = /\bmaxHeight="(\d+)"/.exec(text);
+        if (mw || mh) out.push({ w: mw ? +mw[1] : 0, h: mh ? +mh[1] : 0, bps: null, from: 'manifest' });
+    }
+    return out;
+}
+
+// Събира всичко в един обект quality
+function buildQuality(variants, played, textForHints) {
+    const vs = (variants || []).filter((v) => v.w || v.h);
+    let top = null;
+    for (const v of vs) {
+        const lab = qualityLabel(v.w, v.h);
+        if (!top || Q_RANK[lab] > Q_RANK[top.label] || (Q_RANK[lab] === Q_RANK[top.label] && (v.bps || 0) > (top.bps || 0))) {
+            top = { label: lab, w: v.w, h: v.h, bps: v.bps, from: v.from };
+        }
+    }
+    const playedLabel = played && (played.w || played.h) ? qualityLabel(played.w, played.h) : null;
+    const q = {
+        label: top ? top.label : playedLabel,
+        width: top ? top.w : (played ? played.w : null) || null,
+        height: top ? top.h : (played ? played.h : null) || null,
+        source: top ? top.from : (playedLabel ? 'player' : null),
+        availableLabels: Array.from(new Set(vs.map((v) => qualityLabel(v.w, v.h)))).sort((a, b) => Q_RANK[b] - Q_RANK[a]),
+        maxBitrateKbps: top && top.bps ? Math.round(top.bps / 1000) : null,
+        playedLabel,
+        playedWidth: played && played.w ? played.w : null,
+        playedHeight: played && played.h ? played.h : null,
+        suspect: false,
+        note: null,
+        camHint: null,
+    };
+    // Заявено високо качество, но много нисък битрейт = вероятно увеличена картина
+    if (top && top.bps && Q_MIN_BPS[top.label] && top.bps < Q_MIN_BPS[top.label]) {
+        q.suspect = true;
+        q.note = 'Заявено ' + top.label + ', но битрейтът е само ' + Math.round(top.bps / 1000) + ' kbps: вероятно увеличена картина.';
+    }
+    // Подсказка за запис от кино (само подсказка, не присъда)
+    const hint = /\b(hd-?cam|cam-?rip|camrip|hd-?ts|telesync|telecine|dvd-?scr|screener)\b|(?:^|[^a-z0-9])cam(?:[^a-z0-9]|$)/i.exec(textForHints || '');
+    if (hint) q.camHint = hint[0].trim().replace(/[^a-z0-9-]/gi, '').toLowerCase() || 'cam';
+    return q;
+}
+
 async function validateCandidate(context, cand) {
     const ref = cand.referer || cand.url;
     let origin = '';
@@ -167,7 +263,9 @@ async function validateCandidate(context, cand) {
             if (!/^\s*#EXTM3U/.test(text)) return { valid: false, why: 'манифестът не е валиден (няма #EXTM3U)' };
 
             let playlistUrl = cand.url;
+            let variants = null;
             if (/#EXT-X-STREAM-INF/.test(text)) {
+                variants = parseHlsVariants(text, cand.url);
                 const lines = text.split(/\r?\n/);
                 const i = lines.findIndex((l) => l.startsWith('#EXT-X-STREAM-INF'));
                 const next = lines.slice(i + 1).find((l) => l.trim() && !l.startsWith('#'));
@@ -195,7 +293,7 @@ async function validateCandidate(context, cand) {
             if (sr.status() !== 200 && sr.status() !== 206) return { valid: false, why: 'първият сегмент връща HTTP ' + sr.status() };
             const kind = sniffBytes(await sr.body());
             if (kind === 'text' || kind === 'empty') return { valid: false, why: 'първият сегмент не е видео' };
-            return { valid: true, duration: vod ? Math.round(duration) : null, vod, segments: segs.length, encrypted, segmentKind: kind };
+            return { valid: true, duration: vod ? Math.round(duration) : null, vod, segments: segs.length, encrypted, segmentKind: kind, variants };
         }
 
         if (cand.kind === 'dash') {
@@ -204,7 +302,7 @@ async function validateCandidate(context, cand) {
             const text = await r.text();
             if (!/<MPD[\s>]/.test(text)) return { valid: false, why: 'MPD не е валиден' };
             const m = /mediaPresentationDuration="([^"]+)"/.exec(text);
-            return { valid: true, duration: m ? Math.round(isoDuration(m[1]) || 0) || null : null, segmentKind: 'not-checked' };
+            return { valid: true, duration: m ? Math.round(isoDuration(m[1]) || 0) || null : null, segmentKind: 'not-checked', variants: parseDashVariants(text) };
         }
 
         const r = await get(cand.url, { Range: 'bytes=0-4095' });
@@ -454,6 +552,7 @@ async function analyze(rawUrl, opts, proxy = null) {
         let clicks = 0;
         let bestTime = 0;
         let playedDuration = null;
+        let playedDims = null;
         let videos = [];
 
         while (Date.now() < deadline) {
@@ -463,6 +562,7 @@ async function analyze(rawUrl, opts, proxy = null) {
                 if (!v.err && v.w > 0 && v.rs >= 2 && v.t > bestTime) {
                     bestTime = v.t;
                     playedDuration = Number.isFinite(v.d) ? v.d : null;
+                    playedDims = { w: v.w, h: v.h };
                 }
             }
             if (bestTime >= 3) break;
@@ -513,6 +613,11 @@ async function analyze(rawUrl, opts, proxy = null) {
         const best = validated.filter((v) => v.valid).sort((a, b) => (b.duration || 0) - (a.duration || 0))[0] || null;
 
         const playing = bestTime >= 3;
+
+        // Качество: от манифеста (най-високият вариант), иначе от размера на картината в плейъра
+        const hintText = title + ' ' + joined + ' ' + found.map((f) => f.url).join(' ');
+        const quality = buildQuality(best ? best.variants : null, playedDims, hintText);
+
         let status, reason;
         
         if (CF_RE.test(title + ' ' + joined.slice(0, 600)) && !found.length) {
@@ -563,6 +668,8 @@ async function analyze(rawUrl, opts, proxy = null) {
                 kind: best.kind, url: best.url, durationSec: best.duration || null, segments: best.segments || null,
                 encrypted: !!best.encrypted, segmentKind: best.segmentKind || null,
             } : null,
+            quality,
+            qualityLabel: quality.label,
             playback: { seconds: Number(bestTime.toFixed(1)), durationSec: playedDuration ? Math.round(playedDuration) : null, videos: videos.slice(0, 3) },
             canDecode,
             frames: texts.slice(0, 5),
