@@ -8,4 +8,5 @@ RUN npm install
 COPY . .
 
 EXPOSE 3000
-CMD ["npm", "start"]
+EXPOSE 3001
+CMD ["sh", "-c", "node script.js & node deep-visit.js & wait"]
