@@ -1,6 +1,4 @@
-// deep-visit.js — FSS Deep Visit Worker (Hybrid Runtime Hooks + Network Redirect Edition)
-// Works equally well for Next.js/React SPAs and traditional PHP/SSR websites.
-
+// deep-visit.js — FSS Deep Visit Worker (Advanced Hybrid Edition with DGA & Safe Bounds)
 const express = require('express');
 const crypto = require('crypto');
 const dns = require('dns').promises;
@@ -47,6 +45,12 @@ const AD_DOMAINS = [
 
 const CF_RE = /just a moment|verifying you are human|verify you are human|checking your browser|attention required/i;
 const SOCIAL_RE = /facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me|telegram\.me|whatsapp\.com|reddit\.com|pinterest\.com|mailto:|javascript:/i;
+
+// Известни легитимни CDN/услуги, които да изключим от подозрителните DGA домейни
+const LEGIT_CDNS = [
+    'cloudflare.com', 'jsdelivr.net', 'googletagmanager.com', 'google-analytics.com',
+    'gstatic.com', 'bootstrapcdn.com', 'jquery.com', 'sharethis.com', 'whatsapp.net'
+];
 
 function safeEqual(a, b) {
     const x = Buffer.from(String(a));
@@ -124,11 +128,32 @@ function getRootDomain(hostname) {
     return parts.length > 2 ? parts.slice(-2).join('.') : hostname.toLowerCase();
 }
 
+function isLegitCdn(hostname) {
+    const h = hostname.toLowerCase();
+    return LEGIT_CDNS.some((c) => h === c || h.endsWith('.' + c));
+}
+
 function adDomainMatch(urlStr) {
     try {
-        const h = new URL(urlStr).hostname.toLowerCase();
+        const u = new URL(urlStr);
+        const h = u.hostname.toLowerCase();
+        
+        // 1. Проверка в познатия масив
         for (const ad of AD_DOMAINS) {
             if (h === ad || h.endsWith('.' + ad)) return ad;
+        }
+
+        // 2. Детекция на динамични/генерирани домейни (DGA) за реклами/попъндъри
+        // Характерно за стрийминг сайтовете е да ползват поддомейни от тип случайни думи (напр. fo.ochringptolemy.com)
+        if (!isLegitCdn(h)) {
+            const parts = h.split('.');
+            if (parts.length >= 3) {
+                const sub = parts[0];
+                // Ако поддомейнът е с дължина над 6 символа и изглежда като случаен сбор от букви (без типични думи като www, api, static)
+                if (sub.length >= 6 && !/^(www|api|cdn|static|assets|img|video|stream|player|embed)$/.test(sub)) {
+                    return h; // Връщаме го като засечен съмнителен домен
+                }
+            }
         }
     } catch { /* ignore */ }
     return null;
@@ -171,10 +196,6 @@ async function analyze(rawUrl, opts) {
     try {
         page = await context.newPage();
 
-        // =========================================================================
-        // ПОДХОД 1: MONKEY PATCHING НА JS RUNTIME (За Next.js, React и PHP скриптове)
-        // Инжектира се ПРЕДИ страницата да зареди какъвто и да е код
-        // =========================================================================
         await page.addInitScript(() => {
             window.__fssIntercepted = [];
 
@@ -188,15 +209,12 @@ async function analyze(rawUrl, opts) {
                 });
             };
 
-            // 1. Прихващане на window.open (основен метод за popunder в JS мрежите)
             const origOpen = window.open;
-            window.open = function (u, name, specs) {
+            window.open = function (u) {
                 record('window.open', u);
                 return origOpen ? origOpen.apply(this, arguments) : null;
             };
 
-            // 2. Прихващане на синтетични кликове върху динамично създадени <a> тагове
-            // (Много попъндър скриптове правят: const a = document.createElement('a'); a.href = adUrl; a.target = '_blank'; a.click();)
             const origAnchorClick = HTMLAnchorElement.prototype.click;
             HTMLAnchorElement.prototype.click = function () {
                 if (this.href && (this.target === '_blank' || this.hostname !== location.hostname)) {
@@ -205,22 +223,14 @@ async function analyze(rawUrl, opts) {
                 return origAnchorClick.apply(this, arguments);
             };
 
-            // 3. Прихващане на директна смяна на location.assign / location.replace
             try {
                 const origAssign = window.location.assign.bind(window.location);
-                window.location.assign = function (u) {
-                    record('location.assign', u);
-                    return origAssign(u);
-                };
+                window.location.assign = function (u) { record('location.assign', u); return origAssign(u); };
                 const origReplace = window.location.replace.bind(window.location);
-                window.location.replace = function (u) {
-                    record('location.replace', u);
-                    return origReplace(u);
-                };
-            } catch (_) { /* Някои браузъри пазят location locked */ }
+                window.location.replace = function (u) { record('location.replace', u); return origReplace(u); };
+            } catch (_) {}
         });
 
-        // Слушател за реално отворени нови табове / popups
         context.on('page', async (p) => {
             if (p === page) return;
             try {
@@ -236,15 +246,11 @@ async function analyze(rawUrl, opts) {
             await p.close().catch(() => {});
         });
 
-        // =========================================================================
-        // ПОДХОД 3: ДЪЛБОК МРЕЖОВ АНАЛИЗ & REDIRECT CHAINS (Работи за PHP & SPA)
-        // =========================================================================
         context.on('request', (req) => {
             const reqUrl = req.url();
             const ad = adDomainMatch(reqUrl);
             if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
 
-            // Записваме външни скриптове и документи (често в PHP сайтовете рекламите са директни <script src="...">)
             try {
                 const u = new URL(reqUrl);
                 const reqRoot = getRootDomain(u.hostname);
@@ -257,7 +263,6 @@ async function analyze(rawUrl, opts) {
             } catch { /* ignore */ }
         });
 
-        // Проследяване на 301/302 вериги (Redirect Chains) — ключово за PHP ротатори (TDS / Keitaro / Binom)
         context.on('response', (res) => {
             const status = res.status();
             if (status >= 300 && status < 400) {
@@ -294,7 +299,6 @@ async function analyze(rawUrl, opts) {
             } catch { /* ignore */ }
         });
 
-        // Зареждане на страницата
         let navError = null;
         try {
             await page.goto(url, { waitUntil: 'networkidle', timeout: 35000 });
@@ -307,14 +311,12 @@ async function analyze(rawUrl, opts) {
         }
         guardOn = true;
 
-        // Изчакваме React хидратацията или късните PHP/JS банери
         await page.waitForTimeout(3500);
 
         const title = await page.title().catch(() => '');
         const bodySnip = await page.evaluate(() => (document.body ? document.body.innerText : '').slice(0, 800)).catch(() => '');
         const isCfChallenge = CF_RE.test(title + ' ' + bodySnip);
 
-        // Разпознаване на стека (Next.js / React vs PHP / класически HTML) и медийни елементи
         let techStack = 'unknown';
         let hasVideo = false, hasIframe = false, hasM3u8 = false;
         let suspiciousOverlays = 0;
@@ -329,7 +331,6 @@ async function analyze(rawUrl, opts) {
                     document.querySelector('[data-reactroot]')
                 );
 
-                // Търсим невидими overlay слоеве (типични и за PHP, и за React стрийминг сайтове)
                 let overlays = 0;
                 const allEls = document.querySelectorAll('div, a, iframe');
                 for (const el of allEls) {
@@ -359,9 +360,6 @@ async function analyze(rawUrl, opts) {
             hasM3u8 = /\.m3u8|\.mpd/.test(info.h);
         } catch { /* ignore */ }
 
-        // =========================================================================
-        // ХИБРИДНА СТРАТЕГИЯ ЗА КЛИКАНЕ (Адаптирана за SPA и PHP)
-        // =========================================================================
         const clicks = Math.min(10, Math.max(1, opts.clicks));
         const waitMs = Math.max(1000, opts.waitMs);
         const vp = page.viewportSize() || { width: 1280, height: 720 };
@@ -371,7 +369,6 @@ async function analyze(rawUrl, opts) {
 
             try {
                 if (i === 0) {
-                    // Клик 1: Центърът на екрана (активира глобални document click listeners и невидими overlays)
                     const cx = vp.width / 2 + (Math.random() * 30 - 15);
                     const cy = vp.height / 2 + (Math.random() * 30 - 15);
                     await page.mouse.move(cx, cy, { steps: 6 });
@@ -380,28 +377,26 @@ async function analyze(rawUrl, opts) {
                     await page.mouse.up();
                     clickLog.push({ n: i + 1, type: 'center_overlay_probe', x: Math.round(cx), y: Math.round(cy), events: (popups + hijacks.length) - before });
                 } else if (i === 1 && techStack === 'classic_ssr_php') {
-                    // За PHP сайтове: кликаме върху вътрешен линк (напр. към филм/статия), защото често рекламите са на вътрешните страници, а не на индекса
                     const internalLink = await page.evaluate((host) => {
                         const links = Array.from(document.querySelectorAll('a[href]')).filter((a) => {
                             try {
                                 const u = new URL(a.href);
                                 const r = a.getBoundingClientRect();
-                                return u.hostname === host && u.pathname.length > 2 && r.width > 20 && r.height > 15 && r.top > 80 && r.top < window.innerHeight;
+                                return u.hostname === host && u.pathname.length > 2 && r.width > 20 && r.height > 15 && r.left > 0 && r.top > 80 && r.top < window.innerHeight;
                             } catch { return false; }
                         });
                         if (!links.length) return null;
                         const pick = links[Math.floor(Math.random() * Math.min(links.length, 10))];
                         const r = pick.getBoundingClientRect();
-                        return { x: r.left + r.width / 2, y: r.top + r.height / 2, href: pick.href };
+                        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
                     }, startHost);
 
-                    if (internalLink) {
+                    if (internalLink && internalLink.x > 0) {
                         await page.mouse.move(internalLink.x, internalLink.y, { steps: 6 });
                         await page.mouse.click(internalLink.x, internalLink.y);
                         clickLog.push({ n: i + 1, type: 'php_internal_nav', x: Math.round(internalLink.x), y: Math.round(internalLink.y), events: (popups + hijacks.length) - before });
                     }
                 } else {
-                    // Търсим безопасни интерактивни елементи (изключваме социалните мрежи!)
                     const safeTarget = await page.evaluate(() => {
                         const social = /facebook|twitter|x\.com|instagram|telegram|whatsapp|reddit|share|intent/i;
                         const els = Array.from(document.querySelectorAll('a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]')).filter((el) => {
@@ -409,7 +404,7 @@ async function analyze(rawUrl, opts) {
                             const cls = String(el.className || '');
                             if (social.test(href) || social.test(cls)) return false;
                             const r = el.getBoundingClientRect();
-                            return r.width > 25 && r.height > 20 && r.top >= 60 && r.bottom <= window.innerHeight - 40;
+                            return r.left >= 0 && r.width > 25 && r.height > 20 && r.top >= 60 && r.bottom <= window.innerHeight - 40;
                         });
                         if (!els.length) return null;
                         const el = els[Math.floor(Math.random() * Math.min(els.length, 12))];
@@ -417,11 +412,12 @@ async function analyze(rawUrl, opts) {
                         return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
                     });
 
-                    if (safeTarget) {
+                    if (safeTarget && safeTarget.x > 0) {
                         await page.mouse.move(safeTarget.x, safeTarget.y, { steps: 6 });
                         await page.mouse.click(safeTarget.x, safeTarget.y);
                         clickLog.push({ n: i + 1, type: 'filtered_element', x: Math.round(safeTarget.x), y: Math.round(safeTarget.y), events: (popups + hijacks.length) - before });
                     } else {
+                        // Строго гарантираме x > 0 (вътре в екрана)
                         const x = Math.floor(Math.random() * (vp.width * 0.5)) + (vp.width * 0.25);
                         const y = Math.floor(Math.random() * (vp.height * 0.5)) + (vp.height * 0.25);
                         await page.mouse.move(x, y, { steps: 6 });
@@ -436,7 +432,6 @@ async function analyze(rawUrl, opts) {
 
         await page.waitForTimeout(1500);
 
-        // Събираме прихванатите JS runtime опити от Подход 1
         try {
             const rawIntercepted = await page.evaluate(() => window.__fssIntercepted || []);
             for (const item of rawIntercepted) {
@@ -448,7 +443,6 @@ async function analyze(rawUrl, opts) {
             }
         } catch { /* ignore */ }
 
-        // Изчисляване на общия резултат от всички слоеве (Popups + Hijacks + JS Hooks + 301/302 Redirects + Ad Domains)
         const totalAdHits = Object.values(adDomainHits).reduce((a, b) => a + b, 0);
         const uniqueJsOpens = new Set(interceptedOpens.map((x) => x.url)).size;
         const uniqueRedirects = new Set(redirectChains.map((x) => x.to)).size;
