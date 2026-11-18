@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 3000
 EXPOSE 3001
-CMD ["sh", "-c", "node script.js & node deep-visit.js & wait"]
+CMD ["sh", "-c", "npm start & node deep-visit.js & wait"]
