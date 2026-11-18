@@ -1,4 +1,6 @@
-// deep-visit.js — FSS Deep Visit Worker (Streaming & Ad-Overlay Edition)
+// deep-visit.js — FSS Deep Visit Worker (Hybrid Runtime Hooks + Network Redirect Edition)
+// Works equally well for Next.js/React SPAs and traditional PHP/SSR websites.
+
 const express = require('express');
 const crypto = require('crypto');
 const dns = require('dns').promises;
@@ -44,6 +46,7 @@ const AD_DOMAINS = [
 ];
 
 const CF_RE = /just a moment|verifying you are human|verify you are human|checking your browser|attention required/i;
+const SOCIAL_RE = /facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me|telegram\.me|whatsapp\.com|reddit\.com|pinterest\.com|mailto:|javascript:/i;
 
 function safeEqual(a, b) {
     const x = Buffer.from(String(a));
@@ -68,7 +71,7 @@ function getBrowser() {
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process'
+                '--disable-features=IsolateOrigins,site-per-process',
             ],
         }).then((b) => {
             b.on('disconnected', () => { browserPromise = null; });
@@ -116,6 +119,11 @@ async function assertSafeUrl(raw) {
     return u;
 }
 
+function getRootDomain(hostname) {
+    const parts = hostname.toLowerCase().split('.');
+    return parts.length > 2 ? parts.slice(-2).join('.') : hostname.toLowerCase();
+}
+
 function adDomainMatch(urlStr) {
     try {
         const h = new URL(urlStr).hostname.toLowerCase();
@@ -128,18 +136,23 @@ function adDomainMatch(urlStr) {
 
 async function analyze(rawUrl, opts) {
     const t0 = Date.now();
-    const url = (await assertSafeUrl(rawUrl)).href;
+    const parsedStart = await assertSafeUrl(rawUrl);
+    const url = parsedStart.href;
+    const startHost = parsedStart.hostname.toLowerCase();
+    const startRoot = getRootDomain(startHost);
     const browser = await getBrowser();
 
     const isMobile = opts.mobile;
     const context = await browser.newContext({
-        userAgent: isMobile ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1' : UA,
+        userAgent: isMobile
+            ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+            : UA,
         viewport: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
         locale: 'en-US',
         ignoreHTTPSErrors: true,
-        isMobile: isMobile,
+        isMobile,
         hasTouch: isMobile,
-        deviceScaleFactor: isMobile ? 3 : 1
+        deviceScaleFactor: isMobile ? 3 : 1,
     });
 
     const killer = setTimeout(() => context.close().catch(() => {}), 90000);
@@ -148,6 +161,9 @@ async function analyze(rawUrl, opts) {
     const hijacks = [];
     const hijackUrls = [];
     const popupUrls = [];
+    const interceptedOpens = [];
+    const redirectChains = [];
+    const externalScripts = new Set();
     const adDomainHits = {};
     const clickLog = [];
     let page;
@@ -155,13 +171,63 @@ async function analyze(rawUrl, opts) {
     try {
         page = await context.newPage();
 
+        // =========================================================================
+        // ПОДХОД 1: MONKEY PATCHING НА JS RUNTIME (За Next.js, React и PHP скриптове)
+        // Инжектира се ПРЕДИ страницата да зареди какъвто и да е код
+        // =========================================================================
+        await page.addInitScript(() => {
+            window.__fssIntercepted = [];
+
+            const record = (type, targetUrl) => {
+                if (!targetUrl || typeof targetUrl !== 'string') return;
+                if (targetUrl.startsWith('about:') || targetUrl.startsWith('javascript:')) return;
+                window.__fssIntercepted.push({
+                    type,
+                    url: targetUrl.slice(0, 300),
+                    ts: Date.now(),
+                });
+            };
+
+            // 1. Прихващане на window.open (основен метод за popunder в JS мрежите)
+            const origOpen = window.open;
+            window.open = function (u, name, specs) {
+                record('window.open', u);
+                return origOpen ? origOpen.apply(this, arguments) : null;
+            };
+
+            // 2. Прихващане на синтетични кликове върху динамично създадени <a> тагове
+            // (Много попъндър скриптове правят: const a = document.createElement('a'); a.href = adUrl; a.target = '_blank'; a.click();)
+            const origAnchorClick = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function () {
+                if (this.href && (this.target === '_blank' || this.hostname !== location.hostname)) {
+                    record('synthetic_a_click', this.href);
+                }
+                return origAnchorClick.apply(this, arguments);
+            };
+
+            // 3. Прихващане на директна смяна на location.assign / location.replace
+            try {
+                const origAssign = window.location.assign.bind(window.location);
+                window.location.assign = function (u) {
+                    record('location.assign', u);
+                    return origAssign(u);
+                };
+                const origReplace = window.location.replace.bind(window.location);
+                window.location.replace = function (u) {
+                    record('location.replace', u);
+                    return origReplace(u);
+                };
+            } catch (_) { /* Някои браузъри пазят location locked */ }
+        });
+
+        // Слушател за реално отворени нови табове / popups
         context.on('page', async (p) => {
             if (p === page) return;
-            popups++;
             try {
                 await p.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
                 const pu = p.url();
-                if (pu && pu !== 'about:blank') {
+                if (pu && pu !== 'about:blank' && !SOCIAL_RE.test(pu)) {
+                    popups++;
                     popupUrls.push(pu.slice(0, 200));
                     const ad = adDomainMatch(pu);
                     if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
@@ -170,18 +236,57 @@ async function analyze(rawUrl, opts) {
             await p.close().catch(() => {});
         });
 
-        context.on('request', (r) => {
-            const ad = adDomainMatch(r.url());
+        // =========================================================================
+        // ПОДХОД 3: ДЪЛБОК МРЕЖОВ АНАЛИЗ & REDIRECT CHAINS (Работи за PHP & SPA)
+        // =========================================================================
+        context.on('request', (req) => {
+            const reqUrl = req.url();
+            const ad = adDomainMatch(reqUrl);
             if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
+
+            // Записваме външни скриптове и документи (често в PHP сайтовете рекламите са директни <script src="...">)
+            try {
+                const u = new URL(reqUrl);
+                const reqRoot = getRootDomain(u.hostname);
+                if (reqRoot !== startRoot && !SOCIAL_RE.test(reqUrl)) {
+                    const rType = req.resourceType();
+                    if (rType === 'script' || rType === 'document' || rType === 'subdocument') {
+                        externalScripts.add(u.hostname.toLowerCase());
+                    }
+                }
+            } catch { /* ignore */ }
+        });
+
+        // Проследяване на 301/302 вериги (Redirect Chains) — ключово за PHP ротатори (TDS / Keitaro / Binom)
+        context.on('response', (res) => {
+            const status = res.status();
+            if (status >= 300 && status < 400) {
+                const loc = res.headers()['location'];
+                if (loc) {
+                    try {
+                        const target = new URL(loc, res.url());
+                        const targetRoot = getRootDomain(target.hostname);
+                        if (targetRoot !== startRoot && !SOCIAL_RE.test(target.href)) {
+                            redirectChains.push({
+                                from: res.url().slice(0, 120),
+                                to: target.href.slice(0, 200),
+                                status,
+                            });
+                            const ad = adDomainMatch(target.href);
+                            if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
+                        }
+                    } catch { /* ignore */ }
+                }
+            }
         });
 
         let guardOn = false;
-        const startHost = new URL(url).hostname;
         page.on('framenavigated', (fr) => {
             if (!guardOn || fr !== page.mainFrame()) return;
             try {
-                const h = new URL(fr.url()).hostname;
-                if (h && h !== startHost) {
+                const u = new URL(fr.url());
+                const h = u.hostname.toLowerCase();
+                if (h && getRootDomain(h) !== startRoot && !SOCIAL_RE.test(fr.url())) {
                     hijackUrls.push(fr.url().slice(0, 200));
                     hijacks.push(fr.url().slice(0, 120));
                     page.goBack({ timeout: 3000 }).catch(() => {});
@@ -189,10 +294,11 @@ async function analyze(rawUrl, opts) {
             } catch { /* ignore */ }
         });
 
+        // Зареждане на страницата
         let navError = null;
         try {
             await page.goto(url, { waitUntil: 'networkidle', timeout: 35000 });
-        } catch (e) {
+        } catch {
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
             } catch (err) {
@@ -201,70 +307,126 @@ async function analyze(rawUrl, opts) {
         }
         guardOn = true;
 
-        // Изчакваме зареждането на асинхронни скриптове и скрити overlay слоеве
-        await page.waitForTimeout(4000);
+        // Изчакваме React хидратацията или късните PHP/JS банери
+        await page.waitForTimeout(3500);
 
         const title = await page.title().catch(() => '');
         const bodySnip = await page.evaluate(() => (document.body ? document.body.innerText : '').slice(0, 800)).catch(() => '');
         const isCfChallenge = CF_RE.test(title + ' ' + bodySnip);
 
+        // Разпознаване на стека (Next.js / React vs PHP / класически HTML) и медийни елементи
+        let techStack = 'unknown';
         let hasVideo = false, hasIframe = false, hasM3u8 = false;
+        let suspiciousOverlays = 0;
+
         try {
-            const info = await page.evaluate(() => ({
-                v: document.querySelectorAll('video').length,
-                i: document.querySelectorAll('iframe').length,
-                h: document.documentElement.outerHTML.slice(0, 200000),
-            }));
+            const info = await page.evaluate(() => {
+                const html = document.documentElement.outerHTML.slice(0, 250000);
+                const isNextOrReact = Boolean(
+                    document.getElementById('__next') ||
+                    document.getElementById('root') ||
+                    window.__NEXT_DATA__ ||
+                    document.querySelector('[data-reactroot]')
+                );
+
+                // Търсим невидими overlay слоеве (типични и за PHP, и за React стрийминг сайтове)
+                let overlays = 0;
+                const allEls = document.querySelectorAll('div, a, iframe');
+                for (const el of allEls) {
+                    const style = window.getComputedStyle(el);
+                    const z = parseInt(style.zIndex, 10) || 0;
+                    if ((style.position === 'fixed' || style.position === 'absolute') && z > 999) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 300 && rect.height > 250) {
+                            overlays++;
+                        }
+                    }
+                }
+
+                return {
+                    isNextOrReact,
+                    overlays,
+                    v: document.querySelectorAll('video').length,
+                    i: document.querySelectorAll('iframe').length,
+                    h: html,
+                };
+            });
+
+            techStack = info.isNextOrReact ? 'spa_react_next' : 'classic_ssr_php';
+            suspiciousOverlays = info.overlays;
             hasVideo = info.v > 0;
             hasIframe = info.i > 0;
             hasM3u8 = /\.m3u8|\.mpd/.test(info.h);
         } catch { /* ignore */ }
 
+        // =========================================================================
+        // ХИБРИДНА СТРАТЕГИЯ ЗА КЛИКАНЕ (Адаптирана за SPA и PHP)
+        // =========================================================================
         const clicks = Math.min(10, Math.max(1, opts.clicks));
         const waitMs = Math.max(1000, opts.waitMs);
         const vp = page.viewportSize() || { width: 1280, height: 720 };
 
         for (let i = 0; i < clicks; i++) {
             const before = popups + hijacks.length;
-            
+
             try {
                 if (i === 0) {
-                    // Първият клик е в центъра на екрана (където обикновено стои плейърът или невидим overlay)
-                    const cx = vp.width / 2 + (Math.random() * 40 - 20);
-                    const cy = vp.height / 2 + (Math.random() * 40 - 20);
-                    await page.mouse.move(cx, cy, { steps: 5 });
+                    // Клик 1: Центърът на екрана (активира глобални document click listeners и невидими overlays)
+                    const cx = vp.width / 2 + (Math.random() * 30 - 15);
+                    const cy = vp.height / 2 + (Math.random() * 30 - 15);
+                    await page.mouse.move(cx, cy, { steps: 6 });
                     await page.mouse.down();
-                    await page.waitForTimeout(50);
+                    await page.waitForTimeout(60);
                     await page.mouse.up();
-                    clickLog.push({ n: i + 1, type: 'center_player_click', x: Math.round(cx), y: Math.round(cy), events: (popups + hijacks.length) - before });
-                } else {
-                    // Търсим бутони за пускане, гледане или линкове към съдържание (избягваме социални бутони)
-                    const targets = await page.$$('a:not([href*="facebook"]):not([href*="twitter"]):not([href*="share"]), button, .play-btn, [id*="play"], [class*="play"], .film-poster');
-                    let clicked = false;
+                    clickLog.push({ n: i + 1, type: 'center_overlay_probe', x: Math.round(cx), y: Math.round(cy), events: (popups + hijacks.length) - before });
+                } else if (i === 1 && techStack === 'classic_ssr_php') {
+                    // За PHP сайтове: кликаме върху вътрешен линк (напр. към филм/статия), защото често рекламите са на вътрешните страници, а не на индекса
+                    const internalLink = await page.evaluate((host) => {
+                        const links = Array.from(document.querySelectorAll('a[href]')).filter((a) => {
+                            try {
+                                const u = new URL(a.href);
+                                const r = a.getBoundingClientRect();
+                                return u.hostname === host && u.pathname.length > 2 && r.width > 20 && r.height > 15 && r.top > 80 && r.top < window.innerHeight;
+                            } catch { return false; }
+                        });
+                        if (!links.length) return null;
+                        const pick = links[Math.floor(Math.random() * Math.min(links.length, 10))];
+                        const r = pick.getBoundingClientRect();
+                        return { x: r.left + r.width / 2, y: r.top + r.height / 2, href: pick.href };
+                    }, startHost);
 
-                    if (targets && targets.length > 0) {
-                        // Взимаме елемент от първата половина на страницата (видимата зона), а не от футъра
-                        const visibleTargets = targets.slice(0, Math.min(targets.length, 15));
-                        const randomEl = visibleTargets[Math.floor(Math.random() * visibleTargets.length)];
-                        const box = await randomEl.boundingBox();
-                        
-                        if (box && box.width > 0 && box.height > 0 && box.y < vp.height) {
-                            const x = box.x + box.width / 2;
-                            const y = box.y + box.height / 2;
-                            await page.mouse.move(x, y, { steps: 5 });
-                            await page.mouse.click(x, y);
-                            clicked = true;
-                            clickLog.push({ n: i + 1, type: 'smart_target', x: Math.round(x), y: Math.round(y), events: (popups + hijacks.length) - before });
-                        }
+                    if (internalLink) {
+                        await page.mouse.move(internalLink.x, internalLink.y, { steps: 6 });
+                        await page.mouse.click(internalLink.x, internalLink.y);
+                        clickLog.push({ n: i + 1, type: 'php_internal_nav', x: Math.round(internalLink.x), y: Math.round(internalLink.y), events: (popups + hijacks.length) - before });
                     }
+                } else {
+                    // Търсим безопасни интерактивни елементи (изключваме социалните мрежи!)
+                    const safeTarget = await page.evaluate(() => {
+                        const social = /facebook|twitter|x\.com|instagram|telegram|whatsapp|reddit|share|intent/i;
+                        const els = Array.from(document.querySelectorAll('a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]')).filter((el) => {
+                            const href = el.getAttribute('href') || '';
+                            const cls = String(el.className || '');
+                            if (social.test(href) || social.test(cls)) return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 25 && r.height > 20 && r.top >= 60 && r.bottom <= window.innerHeight - 40;
+                        });
+                        if (!els.length) return null;
+                        const el = els[Math.floor(Math.random() * Math.min(els.length, 12))];
+                        const r = el.getBoundingClientRect();
+                        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                    });
 
-                    if (!clicked) {
-                        // Fallback: клик в централната зона на екрана
-                        const x = Math.floor(Math.random() * (vp.width * 0.6)) + (vp.width * 0.2);
-                        const y = Math.floor(Math.random() * (vp.height * 0.6)) + (vp.height * 0.2);
-                        await page.mouse.move(x, y, { steps: 5 });
+                    if (safeTarget) {
+                        await page.mouse.move(safeTarget.x, safeTarget.y, { steps: 6 });
+                        await page.mouse.click(safeTarget.x, safeTarget.y);
+                        clickLog.push({ n: i + 1, type: 'filtered_element', x: Math.round(safeTarget.x), y: Math.round(safeTarget.y), events: (popups + hijacks.length) - before });
+                    } else {
+                        const x = Math.floor(Math.random() * (vp.width * 0.5)) + (vp.width * 0.25);
+                        const y = Math.floor(Math.random() * (vp.height * 0.5)) + (vp.height * 0.25);
+                        await page.mouse.move(x, y, { steps: 6 });
                         await page.mouse.click(x, y);
-                        clickLog.push({ n: i + 1, type: 'random_middle', x, y, events: (popups + hijacks.length) - before });
+                        clickLog.push({ n: i + 1, type: 'safe_zone_coord', x: Math.round(x), y: Math.round(y), events: (popups + hijacks.length) - before });
                     }
                 }
             } catch { /* ignore */ }
@@ -272,10 +434,32 @@ async function analyze(rawUrl, opts) {
             await page.waitForTimeout(waitMs);
         }
 
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1500);
 
+        // Събираме прихванатите JS runtime опити от Подход 1
+        try {
+            const rawIntercepted = await page.evaluate(() => window.__fssIntercepted || []);
+            for (const item of rawIntercepted) {
+                if (!SOCIAL_RE.test(item.url)) {
+                    interceptedOpens.push(item);
+                    const ad = adDomainMatch(item.url);
+                    if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
+                }
+            }
+        } catch { /* ignore */ }
+
+        // Изчисляване на общия резултат от всички слоеве (Popups + Hijacks + JS Hooks + 301/302 Redirects + Ad Domains)
         const totalAdHits = Object.values(adDomainHits).reduce((a, b) => a + b, 0);
-        const score = (hijacks.length * 10) + (popups * 5) + totalAdHits;
+        const uniqueJsOpens = new Set(interceptedOpens.map((x) => x.url)).size;
+        const uniqueRedirects = new Set(redirectChains.map((x) => x.to)).size;
+
+        const score =
+            (hijacks.length * 10) +
+            (popups * 5) +
+            (uniqueJsOpens * 4) +
+            (uniqueRedirects * 3) +
+            (suspiciousOverlays * 2) +
+            totalAdHits;
 
         let level = 'none';
         if (score >= 30) level = 'high';
@@ -285,6 +469,7 @@ async function analyze(rawUrl, opts) {
         return {
             success: true,
             url,
+            detected_stack: techStack,
             status: isCfChallenge ? 'blocked' : (navError ? 'error' : 'loaded'),
             nav_error: navError,
             title,
@@ -293,17 +478,26 @@ async function analyze(rawUrl, opts) {
             has_video: hasVideo,
             has_iframe: hasIframe,
             has_m3u8_in_html: hasM3u8,
-            clicks: clicks,
+            suspicious_overlays: suspiciousOverlays,
+            clicks,
             click_log: clickLog,
             popups,
             hijacks: hijacks.length,
+            js_runtime_hooks_triggered: uniqueJsOpens,
+            network_redirects_triggered: uniqueRedirects,
             ad_domain_hits: totalAdHits,
             ad_domains: Object.keys(adDomainHits),
             ad_domain_breakdown: adDomainHits,
-            bad_events: hijacks.length + popups,
+            external_script_hosts: Array.from(externalScripts).slice(0, 25),
+            bad_events: hijacks.length + popups + uniqueJsOpens,
             ad_score: score,
             ad_level: level,
-            evidence: { popup_urls: popupUrls.slice(0, 10), hijack_urls: hijackUrls.slice(0, 10) },
+            evidence: {
+                popup_urls: popupUrls.slice(0, 10),
+                hijack_urls: hijackUrls.slice(0, 10),
+                js_intercepted: interceptedOpens.slice(0, 10),
+                redirect_chains: redirectChains.slice(0, 10),
+            },
         };
     } catch (e) {
         return { success: false, error: e.message.split('\n')[0], elapsed_sec: Math.round((Date.now() - t0) / 100) / 10 };
@@ -321,9 +515,9 @@ app.get('/deep-check', auth, async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ success: false, error: 'Missing URL' });
     const clicks = Math.min(10, Math.max(1, parseInt(req.query.clicks || '5', 10) || 5));
-    const waitSec = Math.min(10, Math.max(1, parseFloat(req.query.wait || '3') || 3));
+    const waitSec = Math.min(10, Math.max(1, parseFloat(req.query.wait || '2.5') || 2.5));
     const mobile = req.query.mobile === '1';
-    
+
     try {
         const result = await runLimited(() => analyze(String(url), { clicks, waitMs: Math.round(waitSec * 1000), mobile }));
         res.json(result);
