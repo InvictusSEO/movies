@@ -1,32 +1,8 @@
-// deep-visit.js — FSS Deep Visit Worker v5 (завършена и поправена)
+// deep-visit.js — FSS Deep Visit Worker v5.1
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
-//
-// v5 (спрямо v4):
-//  - Куките (window.open, synthetic click, form submit) се докладват веднага към Node през exposeBinding,
-//    затова не се губят при навигация между страници.
-//  - Цел: плейърът. Откриване по DOM (video / голям iframe / player контейнер), не по URL.
-//    Клик върху <video>, iframe и контейнери; до 3 клика на плейъра с различно отместване.
-//  - Празните опити (няма елемент) НЕ харчат бюджета от кликове.
-//  - Линкове към съдържание: не от меню/хедър/футър; target=_blank се сваля, за да не се брои собствен таб за popup.
-//  - Пауза ~6 сек. с движение/скрол преди първия клик (рекламните скриптове се "активират" със закъснение).
-//  - Втори рунд в НОВ чист контекст директно на намерената страница с плейър (рекламите имат лимит по бисквитки).
-//  - Параметър play_url: директен адрес на страница с плейър (препоръчително да се пази в базата).
-//  - Точкуване по УНИКАЛНИ рекламни хостове (не по заявки); реклами и тракери са разделени;
-//    DGA хевристиката е само информативна (не точкува).
-//  - JS-отваряния се точкуват само над броя реални popup-и (без двойно броене).
-//  - @@ изключения и опции ($domain=, ~, redirect…) в списъците се уважават.
-//  - Състояние "неубедителен тест": inconclusive / confidence / verdict / test_notes.
-//  - SSRF защита за ВСЯКА заявка на браузъра (частни IP, localhost, имена без точка, .local/.internal).
-//  - Новият headless режим (по-малко разпознаваем) с автоматично връщане към стария, ако не стартира.
-//  - В отговора: environment (headless, proxy, ua) и rounds.
-//  - Съвместимо с v4: всички стари полета са налични.
-//
-// ENV: DEEP_VISIT_PORT, DEEP_VISIT_KEY, DEEP_VISIT_MAX_CONCURRENT, DEEP_VISIT_PROXY (по избор),
-//      DEEP_VISIT_HEADFUL=1 (иска xvfb), DEEP_VISIT_NEW_HEADLESS=0 (изключва новия headless),
-//      DEEP_VISIT_ROUNDS (по подразбиране 2), DEEP_VISIT_UA, DEEP_VISIT_EXECUTABLE,
-//      DEEP_VISIT_ALLOW_QUERY_KEY=0 (приема ключ само в хедър x-api-key), DEEP_VISIT_EXTRA_ARGS (през запетая).
-//
-// API: GET /deep-check?url=...&clicks=6&wait=2.5&mobile=0|1&deep=1|0&rounds=1..3&play_url=...
+// v5.1: hijack вече се брои САМО за рекламни/съмнителни дестинации; легитимни външни навигации
+//       (сродни проекти като wikimedia.org, CDN-и, app store) не се броят за hijack.
+//       -> Wikipedia вече е clean, а реалните рекламни redirect-и още се хващат.
 
 const express = require('express');
 const crypto = require('crypto');
@@ -46,11 +22,8 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5';
+const WORKER_VERSION = 'v5.1';
 
-// ---------------------------------------------------------------------------------------------
-// Списъци
-// ---------------------------------------------------------------------------------------------
 const AD_DOMAINS = [
   'doubleclick.net','googlesyndication.com','googleadservices.com','adservice.google.com',
   'popads.net','popcash.net','propellerads.com','propellerpops.com','onclickalgo.com',
@@ -137,9 +110,6 @@ const COMMON_WORDS = [
   'static','assets','cdn','content','api','web','app','box','hub','zone','base','core','dev',
 ];
 
-// ---------------------------------------------------------------------------------------------
-// Динамични блок-листове: AD_SET (реклами) и TRACKER_SET (тракери/смесени), ALLOW_SET (изключения)
-// ---------------------------------------------------------------------------------------------
 const AD_SET = new Set();
 const TRACKER_SET = new Set();
 const ALLOW_SET = new Set();
@@ -159,7 +129,6 @@ async function fetchText(url, ms = 60000) {
 const DOMAIN_RE = /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/;
 const BAD_OPTS = /(^|,)(domain=|~|redirect|removeparam|dnsrewrite|csp|badfilter|cookie|replace|denyallow|app=|client=|header=|rewrite)/i;
 
-// Връща { type: 'block'|'allow'|null, domain } за един ред от списък.
 function parseListLine(line, fmt) {
   line = String(line || '').trim();
   if (!line || line[0] === '!' || line[0] === '#' || line[0] === '[') return { type: null };
@@ -174,10 +143,7 @@ function parseListLine(line, fmt) {
   if (!m) return { type: null };
   const d = m[1].toLowerCase();
   const opts = m[2] || '';
-  if (allow) {
-    // изключенията се прилагат глобално само когато нямат никакви опции
-    return opts === '' ? { type: 'allow', domain: d } : { type: null };
-  }
+  if (allow) return opts === '' ? { type: 'allow', domain: d } : { type: null };
   if (opts && BAD_OPTS.test(opts)) return { type: null };
   return { type: 'block', domain: d };
 }
@@ -219,9 +185,6 @@ async function refreshBlocklists() {
   console.log('[deep-visit] blocklist: ads', AD_SET.size, 'trackers', TRACKER_SET.size, 'allow', ALLOW_SET.size);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Помощни
-// ---------------------------------------------------------------------------------------------
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));
   const y = Buffer.from(String(b));
@@ -253,7 +216,6 @@ function isPrivateIp(ip) {
   return true;
 }
 
-// Дали хост е позволен (за браузъра). Кеш по хост.
 const hostCache = new Map();
 function hostAllowed(host) {
   const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
@@ -268,7 +230,7 @@ function hostAllowed(host) {
         sleep(4000).then(() => { throw new Error('dns timeout'); }),
       ]);
       return addrs.length > 0 && !addrs.some((a) => isPrivateIp(a.address));
-    } catch { return true; } // не се резолвира: браузърът сам ще се провали
+    } catch { return true; }
   })();
   hostCache.set(h, p);
   if (hostCache.size > 5000) hostCache.delete(hostCache.keys().next().value);
@@ -321,7 +283,6 @@ function setMatch(set, h) {
   }
   return null;
 }
-// Реклама: твърд списък (винаги) + динамични реклами (освен ако има @@ изключение или е легитимен CDN).
 function adMatchHost(h) {
   if (!h) return null;
   for (const ad of AD_DOMAINS) if (h === ad || h.endsWith('.' + ad)) return ad;
@@ -343,7 +304,6 @@ function adDomainMatch(urlStr) {
 function trackerDomainMatch(urlStr) {
   try { return trackerMatchHost(new URL(urlStr).hostname.toLowerCase()); } catch { return null; }
 }
-// Само информативно (не точкува).
 function looksLikeDga(host) {
   const sld = getRootDomain(host).split('.')[0];
   if (!sld || sld.length < 8 || !/^[a-z0-9-]+$/.test(sld)) return false;
@@ -351,9 +311,6 @@ function looksLikeDga(host) {
   return true;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Браузър
-// ---------------------------------------------------------------------------------------------
 let browserPromise = null;
 let browserMode = 'unknown';
 function getBrowser() {
@@ -436,7 +393,6 @@ async function syncClientHints(p, ua, isMobile, fullVer) {
   } catch { /* ignore */ }
 }
 
-// Скрипт, който се изпълнява във ВСЕКИ document/frame преди страницата. Докладва към Node през binding.
 function hookScript(bindName) {
   try {
     const nativeToString = Function.prototype.toString;
@@ -505,9 +461,6 @@ function hookScript(bindName) {
   } catch (_) {}
 }
 
-// ---------------------------------------------------------------------------------------------
-// Основен анализ
-// ---------------------------------------------------------------------------------------------
 const CF_RE = /just a moment|verifying you are human|verify you are human|checking your browser|attention required/i;
 const PLAYER_SEL = 'video, iframe, [id*="player" i], [class*="player" i], [class*="jwplayer"], [class*="video-js"], [class*="plyr"], [class*="dplayer"], [id*="video" i]';
 const PLAY_SEL = 'a, button, [role="button"], [class*="play"], [class*="watch"], [class*="btn"]';
@@ -531,7 +484,6 @@ async function analyze(rawUrl, opts) {
     ? 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + major + '.0.0.0 Mobile Safari/537.36'
     : (process.env.DEEP_VISIT_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + major + '.0.0.0 Safari/537.36');
 
-  // Споделено състояние за всички рундове
   const S = {
     popupRecords: [],
     hijackUrls: [],
@@ -539,9 +491,9 @@ async function analyze(rawUrl, opts) {
     redirectChains: [],
     externalScripts: new Set(),
     unknownHosts: new Set(),
-    adHosts: new Map(),       // домейн -> брой заявки (само от основната страница)
+    adHosts: new Map(),
     trackerHosts: new Map(),
-    adNavHosts: new Map(),    // реклами, към които водят popup/пренасочване
+    adNavHosts: new Map(),
     clickLog: [],
     downloads: 0,
     siteRoots: new Set([startRoot]),
@@ -584,7 +536,6 @@ async function analyze(rawUrl, opts) {
     let clicks = 0;
     const clickedSigs = new Set();
     try {
-      // SSRF: всяка заявка на браузъра се проверява
       await context.route('**/*', async (route) => {
         try {
           const u = new URL(route.request().url());
@@ -596,7 +547,6 @@ async function analyze(rawUrl, opts) {
         } catch (_) {}
         return route.continue().catch(() => {});
       });
-      // Куки -> Node (оцеляват навигация)
       const bindName = '_f' + crypto.randomBytes(6).toString('hex');
       await context.exposeBinding(bindName, (_src, type, u, pageUrl) => {
         try {
@@ -619,14 +569,18 @@ async function analyze(rawUrl, opts) {
         lastMainUrl = u;
         let h;
         try { h = new URL(u).hostname.toLowerCase(); } catch { return; }
-        if (!h || S.siteRoots.has(getRootDomain(h)) || isSocialUrl(u)) return;
+        if (!h || S.siteRoots.has(getRootDomain(h)) || isSocialUrl(u) || isLegitCdn(h) || isBenignUrl(u)) return;
         const ad = adDomainMatch(u);
         if (ad) bump(S.adNavHosts, ad);
         if (phase === 'load') {
           S.redirectChains.push({ from: String(prev).slice(0, 120), to: u.slice(0, 200), status: 'load_nav', src: 'page' });
-        } else {
+        } else if (ad || looksLikeDga(h)) {
+          // истински hijack: страницата е изпратена към рекламен/съмнителен домейн
           S.hijackUrls.push(u.slice(0, 200));
           page.goBack({ timeout: 3000 }).catch(() => {});
+        } else {
+          // легитимна външна навигация от наш клик (сроден проект и др.) — не е hijack
+          S.redirectChains.push({ from: String(prev).slice(0, 120), to: u.slice(0, 200), status: 'ext_nav', src: 'page' });
         }
       });
       context.on('page', async (p) => {
@@ -652,10 +606,8 @@ async function analyze(rawUrl, opts) {
         p.on('framenavigated', track);
         try { track(p.mainFrame()); } catch (_) {}
         syncClientHints(p, ua, isMobile, fullVer).catch(() => {});
-        // оставяме го малко да се пренасочва (за веригата), после затваряме
         setTimeout(() => { p.close().catch(() => {}); }, S.popupRecords.length > 12 ? 300 : 5000);
       });
-      // Заявки от основната страница (без popup-и): уникални рекламни/тракер хостове
       context.on('request', (req) => {
         try {
           const fr = req.frame();
@@ -693,14 +645,12 @@ async function analyze(rawUrl, opts) {
           }
         } catch (_) {}
       });
-      // ---- Зареждане ----
       try {
         await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
       } catch (err) {
         if (!S.loaded) S.navError = String(err.message || err).split('\n')[0];
       }
       await sleep(2500);
-      // Cloudflare проверка: изчакваме малко да се реши сама
       let title = await page.title().catch(() => '');
       let bodySnip = await page.evaluate(() => (document.body ? document.body.innerText : '').slice(0, 800)).catch(() => '');
       let cf = CF_RE.test(title + ' ' + bodySnip);
@@ -720,7 +670,6 @@ async function analyze(rawUrl, opts) {
       if (idx === 0) S.title = title;
       try { S.siteRoots.add(getRootDomain(new URL(page.url()).hostname)); } catch (_) {}
       lastMainUrl = page.url();
-      // Пауза със "жив" потребител: движение + скрол (активира забавени рекламни скриптове)
       const vp = page.viewportSize() || { width: 1280, height: 720 };
       for (let i = 0; i < 4; i++) {
         try {
@@ -735,7 +684,6 @@ async function analyze(rawUrl, opts) {
         await sleep(850);
       }
       phase = 'interact';
-      // Информация за страницата (само първия рунд)
       if (idx === 0) {
         try {
           const pageInfo = await page.evaluate(() => {
@@ -766,7 +714,6 @@ async function analyze(rawUrl, opts) {
           S.hasM3u8 = /\.m3u8|\.mpd/.test(pageInfo.h);
         } catch (_) {}
       }
-      // ---- Действия ----
       function refreshDetail() {
         try {
           const p = new URL(page.url()).pathname;
@@ -804,7 +751,6 @@ async function analyze(rawUrl, opts) {
         await tapOrClick(x, y);
         return { x: Math.round(x), y: Math.round(y) };
       }
-      // Един клик = една стъпка; бюджетът се харчи САМО при реален клик.
       async function step(type, fn) {
         if (clicks >= total || Date.now() > deadline - 3000) return false;
         const before = rawBad();
@@ -988,7 +934,6 @@ async function analyze(rawUrl, opts) {
         await tapOrClick(x, y);
         return { x: Math.round(x), y: Math.round(y) };
       }
-      // 1) Проба в центъра (само при вход през начална страница)
       if (!direct) await step('center_probe', centerProbe);
       if (!opts.deep) {
         let guard = 0;
@@ -1007,7 +952,6 @@ async function analyze(rawUrl, opts) {
             if (ok) { playerClicks++; info.player_clicks = playerClicks; continue; }
             break;
           }
-          // Плейърът може да се зареди със закъснение
           if (lateWaitFor !== cur) { lateWaitFor = cur; await sleep(2500); continue; }
           if (navClicks < 4) {
             if (await step('play_button', findPlayButton)) { navClicks++; await sleep(1500); continue; }
@@ -1026,7 +970,6 @@ async function analyze(rawUrl, opts) {
         }
       }
       await sleep(4000);
-      // Късна информация
       try {
         const late = await page.evaluate(() => ({ v: document.querySelectorAll('video').length, i: document.querySelectorAll('iframe').length }));
         S.hasVideo = S.hasVideo || late.v > 0;
@@ -1060,7 +1003,6 @@ async function analyze(rawUrl, opts) {
       roundsInfo.push(info);
       if (info.blocked) break;
     }
-    // ---- Обобщение ----
     const seenInt = new Set();
     const dedupInt = S.interceptedOpens.filter((x) => {
       if (isSocialUrl(x.url) || isBenignUrl(x.url)) return false;
@@ -1069,7 +1011,6 @@ async function analyze(rawUrl, opts) {
       seenInt.add(k);
       return true;
     });
-    // кои JS отваряния са "външни" (различен root от сайта и от страницата, от която идват)
     const extOpens = dedupInt.filter((x) => {
       if (x.url.startsWith('about:')) return false;
       const to = rootOfUrl(x.url);
@@ -1085,7 +1026,6 @@ async function analyze(rawUrl, opts) {
     const effectivePopups = S.popupRecords.filter((r) => {
       const real = r.urls.filter((u) => u && u !== 'about:blank');
       if (!real.length) return true;
-      // собствени табове на сайта (не реклама) не са popup
       if (real.every((u) => S.siteRoots.has(rootOfUrl(u)) && !adDomainMatch(u))) return false;
       return real.some((u) => !isSocialUrl(u) && !isBenignUrl(u));
     });
@@ -1101,7 +1041,6 @@ async function analyze(rawUrl, opts) {
       seenRed.add(k);
       return true;
     });
-    // Пренасочване точкува само ако е от основната страница и е от/към разпознат рекламен домейн
     const adRedirects = dedupRed.filter((x) => x.src === 'page' && (adDomainMatch(x.to) || adDomainMatch(x.from)));
     const uniqueRedirects = new Set(adRedirects.map((x) => x.to)).size;
     const adHostCount = Math.min(15, S.adHosts.size);
@@ -1122,7 +1061,6 @@ async function analyze(rawUrl, opts) {
     if (score >= 30) level = 'high';
     else if (score >= 10) level = 'medium';
     else if (score >= 1) level = 'low';
-    // Колко е убедителен тестът
     const notes = [];
     if (S.cfChallenge) notes.push('cf_blocked');
     if (!S.loaded && !S.cfChallenge) notes.push('page_not_loaded');
@@ -1134,7 +1072,6 @@ async function analyze(rawUrl, opts) {
     if (S.cfChallenge || !S.loaded) confidence = 'none';
     else if (!S.playerClicked) confidence = 'low';
     else if (S.playerClicked && popups === 0 && S.adHosts.size > 0 && browserMode !== 'headful') confidence = 'medium';
-    // Чист сайт без плейърна повърхност и без рекламни сигнали -> уверен "чист"
     const noPlayerSurface = !S.hasVideo && !S.hasIframe && !S.playerFound;
     if (S.loaded && !S.cfChallenge && noPlayerSurface && S.adHosts.size === 0 && popups === 0 && S.hijackUrls.length === 0) {
       confidence = 'high';
@@ -1177,7 +1114,7 @@ async function analyze(rawUrl, opts) {
       ad_domain_breakdown: adDomainBreakdown,
       tracker_domains: Array.from(S.trackerHosts.keys()).slice(0, 20),
       external_script_hosts: Array.from(S.externalScripts).slice(0, 25),
-      suspicious_script_hosts: Array.from(S.unknownHosts).slice(0, 15), // само информативно, не точкува
+      suspicious_script_hosts: Array.from(S.unknownHosts).slice(0, 15),
       downloads: S.downloads,
       detail_page_reached: S.detailReached,
       player_found: S.playerFound,
@@ -1215,9 +1152,6 @@ async function analyze(rawUrl, opts) {
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// HTTP
-// ---------------------------------------------------------------------------------------------
 function buildApp() {
   const app = express();
   app.get('/health', (_req, res) => res.json({
