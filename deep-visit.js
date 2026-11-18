@@ -1,7 +1,4 @@
-// deep-visit.js — FSS Deep Visit Worker
-// Ad-intrusiveness measurement: opens URL, clicks N times, counts popups + hijacks + ad domains
-// Runs on port 3001 (separate from script.js/WAM Radar on 3000)
-
+// deep-visit.js — FSS Deep Visit Worker (Bulletproof Edition)
 const express = require('express');
 const crypto = require('crypto');
 const dns = require('dns').promises;
@@ -66,7 +63,13 @@ function getBrowser() {
     if (!browserPromise) {
         browserPromise = chromium.launch({
             headless: true,
-            args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'],
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process'
+            ],
         }).then((b) => {
             b.on('disconnected', () => { browserPromise = null; });
             return b;
@@ -128,7 +131,6 @@ async function analyze(rawUrl, opts) {
     const url = (await assertSafeUrl(rawUrl)).href;
     const browser = await getBrowser();
 
-    // ТУК Е ПРОМЯНАТА ЗА МОБИЛЕН РЕЖИМ
     const isMobile = opts.mobile;
     const context = await browser.newContext({
         userAgent: isMobile ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1' : UA,
@@ -136,7 +138,8 @@ async function analyze(rawUrl, opts) {
         locale: 'en-US',
         ignoreHTTPSErrors: true,
         isMobile: isMobile,
-        hasTouch: isMobile
+        hasTouch: isMobile,
+        deviceScaleFactor: isMobile ? 3 : 1
     });
 
     const killer = setTimeout(() => context.close().catch(() => {}), 90000);
@@ -152,11 +155,12 @@ async function analyze(rawUrl, opts) {
     try {
         page = await context.newPage();
 
+        // Подобрено хващане на нови изскачащи прозорци / тагове
         context.on('page', async (p) => {
             if (p === page) return;
             popups++;
             try {
-                await p.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {});
+                await p.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
                 const pu = p.url();
                 if (pu && pu !== 'about:blank') {
                     popupUrls.push(pu.slice(0, 200));
@@ -167,13 +171,8 @@ async function analyze(rawUrl, opts) {
             await p.close().catch(() => {});
         });
 
-        await context.route('**/*', (route) => {
-            try {
-                const t = route.request().resourceType();
-                if (t === 'font' || t === 'image') return route.abort();
-            } catch { /* ignore */ }
-            return route.continue();
-        });
+        // НЕ спираме изображенията и шрифтовете, за да не чупим рекламните скриптове!
+        // Премахнат е агресивният route.abort() за картинки.
 
         context.on('request', (r) => {
             const ad = adDomainMatch(r.url());
@@ -196,13 +195,19 @@ async function analyze(rawUrl, opts) {
 
         let navError = null;
         try {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(url, { waitUntil: 'networkidle', timeout: 35000 });
         } catch (e) {
-            navError = e.message.split('\n')[0];
+            // Fallback ако networkidle се забави прекалено много
+            try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            } catch (err) {
+                navError = err.message.split('\n')[0];
+            }
         }
         guardOn = true;
 
-        await page.waitForTimeout(2000);
+        // Изчакваме допълнително време за латентни (lazy-loaded) реклами
+        await page.waitForTimeout(4000);
 
         const title = await page.title().catch(() => '');
         const bodySnip = await page.evaluate(() => (document.body ? document.body.innerText : '').slice(0, 800)).catch(() => '');
@@ -221,21 +226,52 @@ async function analyze(rawUrl, opts) {
         } catch { /* ignore */ }
 
         const clicks = Math.min(10, Math.max(1, opts.clicks));
-        const waitMs = Math.max(500, opts.waitMs);
-        const vp = page.viewportSize() || { width: 1280, height: 720 };
+        const waitMs = Math.max(1000, opts.waitMs);
 
+        // Интелигентно кликане: Опитваме се да намерим реални линкове или бутони, за да предизвикаме попъндър
         for (let i = 0; i < clicks; i++) {
             const before = popups + hijacks.length;
-            // Коригирахме малко координатите, за да пасват и на тесни мобилни екрани
-            const x = Math.max(20, Math.floor(Math.random() * (vp.width - 100))) + 50;
-            const y = Math.max(20, Math.floor(Math.random() * (vp.height - 100))) + 50;
-            try { await page.mouse.click(x, y); } catch { /* ignore */ }
+            let clickedOnElement = false;
+
+            try {
+                // Взимаме списък с линкове или бутони видими на екрана
+                const interactiveSelectors = 'a, button, input[type="submit"], [role="button"]';
+                const elements = await page.$$(interactiveSelectors);
+                
+                if (elements && elements.length > 0) {
+                    // Избираме произволен интерактивен елемент
+                    const randomEl = elements[Math.floor(Math.random() * elements.length)];
+                    const box = await randomEl.boundingBox();
+                    
+                    if (box && box.width > 0 && box.height > 0) {
+                        const x = box.x + box.width / 2;
+                        const y = box.y + box.height / 2;
+                        
+                        await page.mouse.move(x, y, { steps: 5 });
+                        await page.mouse.click(x, y);
+                        clickedOnElement = true;
+                        clickLog.push({ n: i + 1, type: 'element', x: Math.round(x), y: Math.round(y), events: (popups + hijacks.length) - before });
+                    }
+                }
+            } catch { /* fallback ако селекторите гръмнат */ }
+
+            // Ако няма намерени елементи или стане грешка, кликаме на безопасна позиция с движение на мишката
+            if (!clickedOnElement) {
+                const vp = page.viewportSize() || { width: 1280, height: 720 };
+                const x = Math.floor(Math.random() * (vp.width - 200)) + 100;
+                const y = Math.floor(Math.random() * (vp.height - 200)) + 100;
+                
+                try {
+                    await page.mouse.move(x, y, { steps: 5 });
+                    await page.mouse.click(x, y);
+                } catch { /* ignore */ }
+                clickLog.push({ n: i + 1, type: 'fallback_coord', x, y, events: (popups + hijacks.length) - before });
+            }
+
             await page.waitForTimeout(waitMs);
-            const after = popups + hijacks.length;
-            clickLog.push({ n: i + 1, x, y, events: after - before });
         }
 
-        await page.waitForTimeout(1000);
+        await page.waitForTimeout(2000);
 
         const totalAdHits = Object.values(adDomainHits).reduce((a, b) => a + b, 0);
         const score = (hijacks.length * 10) + (popups * 5) + totalAdHits;
@@ -284,8 +320,8 @@ app.get('/deep-check', auth, async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ success: false, error: 'Missing URL' });
     const clicks = Math.min(10, Math.max(1, parseInt(req.query.clicks || '5', 10) || 5));
-    const waitSec = Math.min(10, Math.max(1, parseFloat(req.query.wait || '2') || 2));
-    const mobile = req.query.mobile === '1'; // ТУК ПРИХВАЩАМЕ mobile=1
+    const waitSec = Math.min(10, Math.max(1, parseFloat(req.query.wait || '3') || 3));
+    const mobile = req.query.mobile === '1';
     
     try {
         const result = await runLimited(() => analyze(String(url), { clicks, waitMs: Math.round(waitSec * 1000), mobile }));
