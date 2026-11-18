@@ -129,12 +129,11 @@ function addBlockDomain(d) {
 }
 
 async function refreshBlocklists() {
-  const sources = [
+    const sources = [
     { name: 'peter_lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext', fmt: 'hosts' },
     { name: 'easylist', url: 'https://easylist.to/easylist/easylist.txt', fmt: 'adblock' },
-    { name: 'easylist_mirror', url: 'https://cdn.jsdelivr.net/gh/easylist/easylist@master/easylist.txt', fmt: 'adblock' },
-    { name: 'adguard_dns', url: 'https://raw.githubusercontent.com/AdguardTeam/AdGuardSDNSFilter/master/Filters/filter.txt', fmt: 'adblock' },
-    { name: 'adguard_mirror', url: 'https://cdn.jsdelivr.net/gh/AdguardTeam/AdGuardSDNSFilter@master/Filters/filter.txt', fmt: 'adblock' },
+    { name: 'easylist_mirror', url: 'https://easylist-downloads.adblockplus.org/easylist.txt', fmt: 'adblock' },
+    { name: 'adguard_dns', url: 'https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt', fmt: 'adblock' },
   ];
   let ok = 0;
   for (const s of sources) {
