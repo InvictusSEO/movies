@@ -1,11 +1,13 @@
-// deep-visit.js — FSS Deep Visit Worker v3
+// deep-visit.js — FSS Deep Visit Worker v4
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
-// v3 поправки спрямо v2:
-//  - Analytics (GA/GTM/Cloudflare Insights) вече НЕ се броят като реклами (isLegitCdn преди blocklist).
-//  - Кликове извън viewport-а (скрито меню x=-250) се отхвърлят; реални touch събития при mobile=1.
-//  - Blocklist: 60s таймаут + огледала (jsDelivr) + статус по източник в /health + логове.
-//  - detail_page_reached се изчислява от финалния URL; допълнителен опит за клик в плейъра.
-//  - По-малък праг за player iframe (160x120) + повече време след Play бутона.
+// v4 поправки (прецизност + устойчивост):
+//  - Wikipedia фалшив "medium": app-store линкове (Google Play badge) вече не се броят за popunder;
+//    първични analytics (intake-analytics.wikimedia.org, umami.* и др.) и собствените SSO/CDN redirect-и
+//    на сайта не се броят като реклами; redirect-и се точкат само ако са към/от ad домейн.
+//  - Request-и от benign popup страници (Play Store и др.) не се броят като ad hits на сканирания сайт.
+//  - Deep flow: сравнение по root домейн (www/огледала), по-широк regex за съдържание, клик върху
+//    частично видими карти (clamp), "умно" добиване на бюджета след навигация (late content/play/iframe).
+//  - play_button пропуска външни линкове и app store badges.
 
 const express = require('express');
 const crypto = require('crypto');
@@ -21,7 +23,7 @@ const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DEEP_VISIT_MAX_CONCURREN
 const PROXY = process.env.DEEP_VISIT_PROXY || '';
 const HEADFUL = process.env.DEEP_VISIT_HEADFUL === '1';
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v3';
+const WORKER_VERSION = 'v4';
 
 const AD_DOMAINS = [
   'doubleclick.net','googlesyndication.com','googleadservices.com','adservice.google.com',
@@ -59,6 +61,8 @@ const AD_DOMAINS = [
   'chooxaur.com','gloaphoo.net','phaurtuh.net','thaudray.com','whephoochi.com','zaubanel.com',
   'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
   'diketime.com','bytogeticr.com','vebo-vast.com','adoto.net','proftrafficcounter.com',
+  'wpadmngr.com','nawpush.com','capndr.com','ntvpforever.com','cabnnr.com','metricswpsh.com',
+  'uuidksinc.net','new-programmatic.com','liftdsp.com',
 ];
 
 const LEGIT_CDNS = [
@@ -70,12 +74,21 @@ const LEGIT_CDNS = [
   'statcounter.com','paypal.com','stripe.com','akamaized.net','akamai.net','fastly.net',
   'edgecastcdn.net','azureedge.net','cloudfront.net','amazonaws.com','twimg.com','fbcdn.net',
   'apple.com','mzstatic.com','sentry.io','hotjar.com','clarity.ms','unpkg.com','dailymotion.com','dmcdn.net',
+  'wikimedia.org','wikipedia.org','wikimediafoundation.org','themoviedb.org','tmdb.org',
 ];
 
 const SOCIAL_HOSTS = [
   'facebook.com','fb.com','twitter.com','x.com','instagram.com','t.me','telegram.me','telegram.org',
   'whatsapp.com','reddit.com','pinterest.com','linkedin.com','tiktok.com',
 ];
+
+const BENIGN_POPUP_HOSTS = [
+  'play.google.com','apps.apple.com','itunes.apple.com','chromewebstore.google.com','addons.mozilla.org',
+];
+
+const ANALYTICS_LABELS = new Set([
+  'intake-analytics','analytics','stats','telemetry','metrics','umami','matomo','piwik','collect','beacon',
+]);
 
 const MULTI_TLDS = new Set([
   'co.uk','org.uk','ac.uk','gov.uk','com.au','net.au','org.au','co.nz','co.jp','co.kr','co.in',
@@ -129,7 +142,7 @@ function addBlockDomain(d) {
 }
 
 async function refreshBlocklists() {
-    const sources = [
+  const sources = [
     { name: 'peter_lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext', fmt: 'hosts' },
     { name: 'easylist', url: 'https://easylist.to/easylist/easylist.txt', fmt: 'adblock' },
     { name: 'easylist_mirror', url: 'https://easylist-downloads.adblockplus.org/easylist.txt', fmt: 'adblock' },
@@ -213,12 +226,22 @@ function isLegitCdn(hostname) {
   const h = String(hostname || '').toLowerCase();
   return LEGIT_CDNS.some((c) => h === c || h.endsWith('.' + c));
 }
+function isAnalyticsHost(hostname) {
+  const first = String(hostname || '').toLowerCase().split('.')[0];
+  return ANALYTICS_LABELS.has(first);
+}
 function isSocialUrl(urlStr) {
   const s = String(urlStr || '');
   if (/^(mailto|tel|javascript|sms):/i.test(s)) return true;
   try {
     const h = new URL(s).hostname.toLowerCase();
     return SOCIAL_HOSTS.some((x) => h === x || h.endsWith('.' + x));
+  } catch { return false; }
+}
+function isBenignUrl(urlStr) {
+  try {
+    const h = new URL(String(urlStr || '')).hostname.toLowerCase();
+    return BENIGN_POPUP_HOSTS.some((b) => h === b || h.endsWith('.' + b));
   } catch { return false; }
 }
 function blocklistMatch(h) {
@@ -235,7 +258,7 @@ function adDomainMatch(urlStr) {
     const h = u.hostname.toLowerCase();
     if (!h) return null;
     for (const ad of AD_DOMAINS) if (h === ad || h.endsWith('.' + ad)) return ad;
-    if (isLegitCdn(h)) return null; // analytics/CDN не са реклами (v3 fix)
+    if (isLegitCdn(h) || isAnalyticsHost(h)) return null;
     return blocklistMatch(h);
   } catch { return null; }
 }
@@ -469,6 +492,14 @@ async function analyze(rawUrl, opts) {
 
     context.on('request', (req) => {
       const reqUrl = req.url();
+      try {
+        const fr = req.frame();
+        const pg = fr ? fr.page() : null;
+        if (pg && pg !== page) {
+          const pu = pg.url();
+          if (isBenignUrl(pu) || isSocialUrl(pu)) return; // реклами в benign popup не се броят
+        }
+      } catch (_) {}
       const ad = adDomainMatch(reqUrl);
       if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
       try {
@@ -479,7 +510,7 @@ async function analyze(rawUrl, opts) {
         if (getRootDomain(host) !== startRoot && !isSocialUrl(reqUrl) &&
             (rType === 'script' || rType === 'document' || rType === 'subdocument')) {
           externalScripts.add(host);
-          if (!ad && !isLegitCdn(host) && looksLikeDga(host)) suspiciousHosts.add(host);
+          if (!ad && !isLegitCdn(host) && !isAnalyticsHost(host) && looksLikeDga(host)) suspiciousHosts.add(host);
         }
       } catch (_) {}
     });
@@ -493,8 +524,6 @@ async function analyze(rawUrl, opts) {
             const target = new URL(loc, res.url());
             if (target.hostname && getRootDomain(target.hostname) !== startRoot && !isSocialUrl(target.href)) {
               redirectChains.push({ from: res.url().slice(0, 120), to: target.href.slice(0, 200), status });
-              const ad = adDomainMatch(target.href);
-              if (ad) adDomainHits[ad] = (adDomainHits[ad] || 0) + 1;
             }
           } catch (_) {}
         }
@@ -554,6 +583,15 @@ async function analyze(rawUrl, opts) {
     let performed = 0;
     const rawBad = () => popupsOpened + hijackUrls.length + downloads;
 
+    function refreshDetail() {
+      try {
+        const p = new URL(page.url()).pathname;
+        detailReached = detailReached ||
+          /\/(watch|watching|episode|player|vod|detail)/i.test(p) ||
+          /\/(movie|movies|film|tv|series|anime|drama)\/[^/]{6,}/i.test(p);
+      } catch (_) {}
+    }
+
     async function tapOrClick(x, y) {
       if (isMobile) {
         await page.touchscreen.tap(x, y);
@@ -569,9 +607,11 @@ async function analyze(rawUrl, opts) {
       try { box = await h.boundingBox(); } catch (_) {}
       if (box) {
         const vp = page.viewportSize() || { width: 1280, height: 720 };
-        const x = box.x + box.width / 2;
-        const y = box.y + box.height / 2;
-        if (x < 0 || y < 0 || x >= vp.width || y >= vp.height) return null; // off-canvas -> пропуск
+        if (box.x + box.width <= 0 || box.x >= vp.width || box.y + box.height <= 0 || box.y >= vp.height) return null;
+        let x = box.x + box.width / 2;
+        let y = box.y + box.height / 2;
+        x = Math.min(Math.max(x, 5), vp.width - 5);
+        y = Math.min(Math.max(y, 5), vp.height - 5);
         await tapOrClick(x, y);
         return { x: Math.round(x), y: Math.round(y) };
       }
@@ -579,18 +619,88 @@ async function analyze(rawUrl, opts) {
       return { x: -1, y: -1 };
     }
 
-    async function doStep(type, fn) {
+    async function doStep(type, fn, skipOnMiss) {
       if (performed >= total || Date.now() - t0 > 115000) return false;
       const before = rawBad();
       let pt = { x: -1, y: -1 };
       let ok = false;
       try { const r = await fn(); if (r) { pt = r; ok = true; } } catch (_) {}
+      if (!ok && skipOnMiss) return false;
       performed++;
       await sleep(waitMs);
       let cur = '';
       try { cur = page.url().slice(0, 100); } catch (_) {}
       clickLog.push({ n: performed, type, x: pt.x, y: pt.y, page: cur, events: rawBad() - before, hit: ok });
       return ok;
+    }
+
+    async function findContentLink() {
+      const pick = await page.evaluate((root) => {
+        const bad = /\/(genre|country|login|register|filter|search|tag|actor|director|year|type|page|privacy|terms|dmca|contact)\b/i;
+        const good = /(movie|movies|film|watch|series|tv|episode|anime|drama|show|video|stream|play|detail|vod|title|info|season)/i;
+        const as = Array.from(document.querySelectorAll('a[href]'));
+        let best = null, bestS = 0;
+        for (let i = 0; i < as.length; i++) {
+          try {
+            const a = as[i];
+            const u = new URL(a.href);
+            const rh = u.hostname.toLowerCase().split('.').slice(-2).join('.');
+            if (rh !== root || bad.test(u.pathname) || u.pathname.length < 4) continue;
+            const r = a.getBoundingClientRect();
+            if (r.width < 30 || r.height < 18) continue;
+            if (r.right <= 0 || r.left >= window.innerWidth) continue;
+            let s = 0;
+            if (good.test(u.pathname)) s += 3;
+            if (u.pathname.length > 12) s += 1;
+            if (a.querySelector('img')) s += 2;
+            if (/poster|card|item|thumb|film|movie/i.test(String(a.className) + ' ' + String(a.parentElement ? a.parentElement.className : ''))) s += 2;
+            if (s > bestS) { bestS = s; best = { idx: i, sig: a.href }; }
+          } catch (_) {}
+        }
+        return bestS >= 3 ? best : null;
+      }, startRoot).catch(() => null);
+      if (!pick || clickedSigs.has(pick.sig)) return null;
+      const handles = await page.$$('a[href]');
+      const h = handles[pick.idx];
+      if (!h) return null;
+      clickedSigs.add(pick.sig);
+      return await clickHandle(h);
+    }
+
+    const PLAY_SEL = 'a, button, [role="button"], [class*="play"], [class*="watch"], [class*="btn"]';
+    async function findPlayButton() {
+      const pick = await page.evaluate(({ sel, root }) => {
+        const els = Array.from(document.querySelectorAll(sel));
+        let best = null, bestS = 0;
+        for (let i = 0; i < els.length; i++) {
+          try {
+            const el = els[i];
+            const r = el.getBoundingClientRect();
+            if (r.width < 30 || r.height < 20) continue;
+            if (r.right <= 0 || r.left >= window.innerWidth) continue;
+            const t = (el.innerText || '').trim().toLowerCase();
+            if (/google play|app store|appgallery|download the app|get it on/i.test(t)) continue;
+            if (el.hostname) {
+              const rh = el.hostname.toLowerCase().split('.').slice(-2).join('.');
+              if (rh !== root) continue;
+            }
+            const href = (el.getAttribute('href') || '').toLowerCase();
+            const cls = String(el.className || '').toLowerCase();
+            let s = 0;
+            if (t.length < 40 && /(^|\s|▶)(play|watch)(\s|$| now| movie)/.test(t)) s += 4;
+            if (/btn[-_ ]?play|play[-_ ]?btn|btn[-_ ]?watch|watch[-_ ]?btn|watching/.test(cls)) s += 3;
+            if (/\/watch|\/play|watching\.html|-watch\b/.test(href)) s += 3;
+            if (s > bestS) { bestS = s; best = { idx: i, sig: el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + t.slice(0, 30) }; }
+          } catch (_) {}
+        }
+        return bestS >= 3 ? best : null;
+      }, { sel: PLAY_SEL, root: startRoot }).catch(() => null);
+      if (!pick || clickedSigs.has(pick.sig)) return null;
+      const handles = await page.$$(PLAY_SEL);
+      const h = handles[pick.idx];
+      if (!h) return null;
+      clickedSigs.add(pick.sig);
+      return await clickHandle(h);
     }
 
     async function clickPlayerIframe(k) {
@@ -617,7 +727,50 @@ async function analyze(rawUrl, opts) {
       return { x: Math.round(x), y: Math.round(y) };
     }
 
-    // 1) Център на страницата
+    const FILTER_SEL = 'a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]';
+    async function filteredPick() {
+      const pick = await page.evaluate(({ sel, skip, social }) => {
+        const els = Array.from(document.querySelectorAll(sel));
+        const cands = [];
+        for (let i = 0; i < els.length; i++) {
+          try {
+            const el = els[i];
+            const href = el.getAttribute('href') || '';
+            if (/^(mailto|tel|javascript):/i.test(href)) continue;
+            if (href) {
+              try {
+                const h = new URL(el.href || href, location.href).hostname.toLowerCase();
+                if (social.some((s) => h === s || h.endsWith('.' + s))) continue;
+              } catch (_) {}
+            }
+            const cls = String(el.className || '');
+            if (/share|social|login|register|bookmark/i.test(cls)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 25 || r.height < 20) continue;
+            if (r.right <= 0 || r.left >= window.innerWidth) continue;
+            const sig = el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + (el.innerText || '').trim().slice(0, 30);
+            if (skip.includes(sig)) continue;
+            cands.push({ idx: i, sig });
+          } catch (_) {}
+        }
+        if (!cands.length) return null;
+        return cands[Math.floor(Math.random() * Math.min(cands.length, 15))];
+      }, { sel: FILTER_SEL, skip: Array.from(clickedSigs), social: SOCIAL_HOSTS }).catch(() => null);
+      if (!pick) {
+        const vp = page.viewportSize() || { width: 1280, height: 720 };
+        const x = Math.floor(vp.width * (0.25 + Math.random() * 0.5));
+        const y = Math.floor(vp.height * (0.25 + Math.random() * 0.5));
+        await tapOrClick(x, y);
+        return { x, y };
+      }
+      const handles = await page.$$(FILTER_SEL);
+      const h = handles[pick.idx];
+      if (!h) return null;
+      clickedSigs.add(pick.sig);
+      return await clickHandle(h);
+    }
+
+    // 1) Център
     await doStep('center_probe', async () => {
       const vp = page.viewportSize() || { width: 1280, height: 720 };
       const x = vp.width / 2 + (Math.random() * 30 - 15);
@@ -634,128 +787,34 @@ async function analyze(rawUrl, opts) {
     });
 
     if (opts.deep) {
-      // 2) Към страница на филм/сериал
-      await doStep('content_link', async () => {
-        const pick = await page.evaluate((host) => {
-          const bad = /\/(genre|country|login|register|filter|search|tag|actor|director|year|type|page|privacy|terms|dmca|contact)\b/i;
-          const good = /\/(movie|movies|film|watch|series|tv|episode|anime|drama|show|video|stream|play)\b/i;
-          const as = Array.from(document.querySelectorAll('a[href]'));
-          let best = null, bestS = 0;
-          for (let i = 0; i < as.length; i++) {
-            try {
-              const a = as[i];
-              const u = new URL(a.href);
-              if (u.hostname !== host || bad.test(u.pathname) || u.pathname.length < 4) continue;
-              const r = a.getBoundingClientRect();
-              if (r.width < 40 || r.height < 30) continue;
-              if (r.left < 0 || r.right > window.innerWidth + 1) continue; // скрито меню
-              let s = 0;
-              if (good.test(u.pathname)) s += 3;
-              if (a.querySelector('img')) s += 2;
-              if (/poster|card|item|thumb|film|movie/i.test(String(a.className) + ' ' + String(a.parentElement ? a.parentElement.className : ''))) s += 2;
-              if (s > bestS) { bestS = s; best = { idx: i, sig: a.href }; }
-            } catch (_) {}
-          }
-          return bestS >= 3 ? best : null;
-        }, startHost).catch(() => null);
-        if (!pick) return null;
-        const handles = await page.$$('a[href]');
-        const h = handles[pick.idx];
-        if (!h) return null;
-        clickedSigs.add(pick.sig);
-        return await clickHandle(h);
-      });
-      await sleep(2000);
-
-      // 3) Play / Watch бутон
-      const PLAY_SEL = 'a, button, [role="button"], [class*="play"], [class*="watch"], [class*="btn"]';
-      await doStep('play_button', async () => {
-        const pick = await page.evaluate((sel) => {
-          const els = Array.from(document.querySelectorAll(sel));
-          let best = null, bestS = 0;
-          for (let i = 0; i < els.length; i++) {
-            try {
-              const el = els[i];
-              const r = el.getBoundingClientRect();
-              if (r.width < 30 || r.height < 20) continue;
-              if (r.left < 0 || r.right > window.innerWidth + 1) continue;
-              const t = (el.innerText || '').trim().toLowerCase();
-              const cls = String(el.className || '').toLowerCase();
-              const href = (el.getAttribute('href') || '').toLowerCase();
-              let s = 0;
-              if (t.length < 40 && /(^|\s|▶)(play|watch)(\s|$| now| movie)/.test(t)) s += 4;
-              if (/btn[-_ ]?play|play[-_ ]?btn|btn[-_ ]?watch|watch[-_ ]?btn|watching/.test(cls)) s += 3;
-              if (/\/watch|\/play|watching\.html|-watch\b/.test(href)) s += 3;
-              if (s > bestS) { bestS = s; best = { idx: i, sig: el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + t.slice(0, 30) }; }
-            } catch (_) {}
-          }
-          return bestS >= 3 ? best : null;
-        }, PLAY_SEL).catch(() => null);
-        if (!pick || clickedSigs.has(pick.sig)) return null;
-        const handles = await page.$$(PLAY_SEL);
-        const h = handles[pick.idx];
-        if (!h) return null;
-        clickedSigs.add(pick.sig);
-        return await clickHandle(h);
-      });
-      await sleep(3000); // повече време за зареждане на плейъра
-
-      // 4+5) Кликове в player iframe-а
+      // 2) Съдържание -> 3) Play -> 4+5) Player
+      await doStep('content_link', findContentLink);
+      await sleep(1500);
+      refreshDetail();
+      await doStep('play_button', findPlayButton);
+      await sleep(2500);
       for (let k = 0; k < 2 && performed < total; k++) {
         const done = await doStep(k === 0 ? 'player_iframe_click' : 'player_iframe_click2', () => clickPlayerIframe(k));
         if (!done && k === 0) break;
       }
-
-      // Допълнителен опит, ако плейърът още не е кликнат
       if (!playerClicked && performed < total) {
         await doStep('player_iframe_retry', () => clickPlayerIframe(0));
       }
     }
 
-    // Останал бюджет: филтрирани елементи
-    const FILTER_SEL = 'a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]';
+    // Умен остатък: ако още не сме стигнали плейъра, опитваме content/play/iframe на ТЕКУЩАТА страница
     while (performed < total && Date.now() - t0 < 115000) {
-      await doStep('filtered_element', async () => {
-        const pick = await page.evaluate(({ sel, skip, social }) => {
-          const els = Array.from(document.querySelectorAll(sel));
-          const cands = [];
-          for (let i = 0; i < els.length; i++) {
-            try {
-              const el = els[i];
-              const href = el.getAttribute('href') || '';
-              if (/^(mailto|tel|javascript):/i.test(href)) continue;
-              if (href) {
-                try {
-                  const h = new URL(el.href || href, location.href).hostname.toLowerCase();
-                  if (social.some((s) => h === s || h.endsWith('.' + s))) continue;
-                } catch (_) {}
-              }
-              const cls = String(el.className || '');
-              if (/share|social|login|register|bookmark/i.test(cls)) continue;
-              const r = el.getBoundingClientRect();
-              if (r.width < 25 || r.height < 20) continue;
-              if (r.left < 0 || r.right > window.innerWidth + 1) continue;
-              const sig = el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + (el.innerText || '').trim().slice(0, 30);
-              if (skip.includes(sig)) continue;
-              cands.push({ idx: i, sig });
-            } catch (_) {}
-          }
-          if (!cands.length) return null;
-          return cands[Math.floor(Math.random() * Math.min(cands.length, 15))];
-        }, { sel: FILTER_SEL, skip: Array.from(clickedSigs), social: SOCIAL_HOSTS }).catch(() => null);
-        if (!pick) {
-          const vp = page.viewportSize() || { width: 1280, height: 720 };
-          const x = Math.floor(vp.width * (0.25 + Math.random() * 0.5));
-          const y = Math.floor(vp.height * (0.25 + Math.random() * 0.5));
-          await tapOrClick(x, y);
-          return { x, y };
+      if (opts.deep && !playerClicked) {
+        if (!detailReached) {
+          const c = await doStep('content_link_late', findContentLink, true);
+          if (c) { await sleep(1500); refreshDetail(); continue; }
         }
-        const handles = await page.$$(FILTER_SEL);
-        const h = handles[pick.idx];
-        if (!h) return null;
-        clickedSigs.add(pick.sig);
-        return await clickHandle(h);
-      });
+        const p = await doStep('play_button_late', findPlayButton, true);
+        if (p) { await sleep(2500); refreshDetail(); continue; }
+        const f = await doStep('player_iframe_late', () => clickPlayerIframe(0), true);
+        if (f) continue;
+      }
+      await doStep('filtered_element', filteredPick);
     }
 
     await sleep(3000);
@@ -768,16 +827,13 @@ async function analyze(rawUrl, opts) {
       hasVideo = hasVideo || late.v > 0;
       hasIframe = hasIframe || late.i > 0;
     } catch (_) {}
-
-    try {
-      detailReached = detailReached || /\/(movie|movies|tv|watch|film|series|episode|anime|drama)/i.test(new URL(page.url()).pathname);
-    } catch (_) {}
+    refreshDetail();
 
     for (const p of context.pages()) {
       for (const fr of p.frames()) {
         try {
           const arr = await fr.evaluate(() => window.__fssIntercepted || []);
-          for (const item of arr) if (!isSocialUrl(item.url)) interceptedOpens.push(item);
+          for (const item of arr) if (!isSocialUrl(item.url) && !isBenignUrl(item.url)) interceptedOpens.push(item);
         } catch (_) {}
       }
     }
@@ -799,7 +855,7 @@ async function analyze(rawUrl, opts) {
     const effectivePopups = popupRecords.filter((r) => {
       const real = r.urls.filter((u) => u && u !== 'about:blank');
       if (!real.length) return true;
-      return real.some((u) => !isSocialUrl(u));
+      return real.some((u) => !isSocialUrl(u) && !isBenignUrl(u));
     });
     const popups = effectivePopups.length;
     const popupUrls = effectivePopups.map((r) => {
@@ -814,7 +870,12 @@ async function analyze(rawUrl, opts) {
       seenRed.add(k);
       return true;
     });
-    const uniqueRedirects = new Set(dedupRed.map((x) => x.to)).size;
+    // Redirect се ТОЧКУВА само ако е от/към разпознат ad домейн (или DGA цел).
+    const adRedirects = dedupRed.filter((x) => {
+      if (adDomainMatch(x.to) || adDomainMatch(x.from)) return true;
+      try { return looksLikeDga(new URL(x.to).hostname); } catch (_) { return false; }
+    });
+    const uniqueRedirects = new Set(adRedirects.map((x) => x.to)).size;
 
     const totalAdHits = Object.values(adDomainHits).reduce((a, b) => a + b, 0);
     const suspCount = suspiciousHosts.size;
@@ -891,7 +952,7 @@ app.get('/health', (_req, res) => res.json({
 app.get('/deep-check', auth, async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ success: false, error: 'Missing URL' });
-  const clicks = Math.min(10, Math.max(1, parseInt(req.query.clicks || '5', 10) || 5));
+  const clicks = Math.min(10, Math.max(1, parseInt(req.query.clicks || '6', 10) || 6));
   const waitSec = Math.min(10, Math.max(1, parseFloat(req.query.wait || '2.5') || 2.5));
   const mobile = req.query.mobile === '1';
   const deep = req.query.deep !== '0';
