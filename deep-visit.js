@@ -1,4 +1,4 @@
-// deep-visit.js — FSS Deep Visit Worker (Bulletproof Edition)
+// deep-visit.js — FSS Deep Visit Worker (Streaming & Ad-Overlay Edition)
 const express = require('express');
 const crypto = require('crypto');
 const dns = require('dns').promises;
@@ -155,7 +155,6 @@ async function analyze(rawUrl, opts) {
     try {
         page = await context.newPage();
 
-        // Подобрено хващане на нови изскачащи прозорци / тагове
         context.on('page', async (p) => {
             if (p === page) return;
             popups++;
@@ -170,9 +169,6 @@ async function analyze(rawUrl, opts) {
             } catch { /* ignore */ }
             await p.close().catch(() => {});
         });
-
-        // НЕ спираме изображенията и шрифтовете, за да не чупим рекламните скриптове!
-        // Премахнат е агресивният route.abort() за картинки.
 
         context.on('request', (r) => {
             const ad = adDomainMatch(r.url());
@@ -197,7 +193,6 @@ async function analyze(rawUrl, opts) {
         try {
             await page.goto(url, { waitUntil: 'networkidle', timeout: 35000 });
         } catch (e) {
-            // Fallback ако networkidle се забави прекалено много
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
             } catch (err) {
@@ -206,7 +201,7 @@ async function analyze(rawUrl, opts) {
         }
         guardOn = true;
 
-        // Изчакваме допълнително време за латентни (lazy-loaded) реклами
+        // Изчакваме зареждането на асинхронни скриптове и скрити overlay слоеве
         await page.waitForTimeout(4000);
 
         const title = await page.title().catch(() => '');
@@ -227,46 +222,52 @@ async function analyze(rawUrl, opts) {
 
         const clicks = Math.min(10, Math.max(1, opts.clicks));
         const waitMs = Math.max(1000, opts.waitMs);
+        const vp = page.viewportSize() || { width: 1280, height: 720 };
 
-        // Интелигентно кликане: Опитваме се да намерим реални линкове или бутони, за да предизвикаме попъндър
         for (let i = 0; i < clicks; i++) {
             const before = popups + hijacks.length;
-            let clickedOnElement = false;
-
+            
             try {
-                // Взимаме списък с линкове или бутони видими на екрана
-                const interactiveSelectors = 'a, button, input[type="submit"], [role="button"]';
-                const elements = await page.$$(interactiveSelectors);
-                
-                if (elements && elements.length > 0) {
-                    // Избираме произволен интерактивен елемент
-                    const randomEl = elements[Math.floor(Math.random() * elements.length)];
-                    const box = await randomEl.boundingBox();
-                    
-                    if (box && box.width > 0 && box.height > 0) {
-                        const x = box.x + box.width / 2;
-                        const y = box.y + box.height / 2;
+                if (i === 0) {
+                    // Първият клик е в центъра на екрана (където обикновено стои плейърът или невидим overlay)
+                    const cx = vp.width / 2 + (Math.random() * 40 - 20);
+                    const cy = vp.height / 2 + (Math.random() * 40 - 20);
+                    await page.mouse.move(cx, cy, { steps: 5 });
+                    await page.mouse.down();
+                    await page.waitForTimeout(50);
+                    await page.mouse.up();
+                    clickLog.push({ n: i + 1, type: 'center_player_click', x: Math.round(cx), y: Math.round(cy), events: (popups + hijacks.length) - before });
+                } else {
+                    // Търсим бутони за пускане, гледане или линкове към съдържание (избягваме социални бутони)
+                    const targets = await page.$$('a:not([href*="facebook"]):not([href*="twitter"]):not([href*="share"]), button, .play-btn, [id*="play"], [class*="play"], .film-poster');
+                    let clicked = false;
+
+                    if (targets && targets.length > 0) {
+                        // Взимаме елемент от първата половина на страницата (видимата зона), а не от футъра
+                        const visibleTargets = targets.slice(0, Math.min(targets.length, 15));
+                        const randomEl = visibleTargets[Math.floor(Math.random() * visibleTargets.length)];
+                        const box = await randomEl.boundingBox();
                         
+                        if (box && box.width > 0 && box.height > 0 && box.y < vp.height) {
+                            const x = box.x + box.width / 2;
+                            const y = box.y + box.height / 2;
+                            await page.mouse.move(x, y, { steps: 5 });
+                            await page.mouse.click(x, y);
+                            clicked = true;
+                            clickLog.push({ n: i + 1, type: 'smart_target', x: Math.round(x), y: Math.round(y), events: (popups + hijacks.length) - before });
+                        }
+                    }
+
+                    if (!clicked) {
+                        // Fallback: клик в централната зона на екрана
+                        const x = Math.floor(Math.random() * (vp.width * 0.6)) + (vp.width * 0.2);
+                        const y = Math.floor(Math.random() * (vp.height * 0.6)) + (vp.height * 0.2);
                         await page.mouse.move(x, y, { steps: 5 });
                         await page.mouse.click(x, y);
-                        clickedOnElement = true;
-                        clickLog.push({ n: i + 1, type: 'element', x: Math.round(x), y: Math.round(y), events: (popups + hijacks.length) - before });
+                        clickLog.push({ n: i + 1, type: 'random_middle', x, y, events: (popups + hijacks.length) - before });
                     }
                 }
-            } catch { /* fallback ако селекторите гръмнат */ }
-
-            // Ако няма намерени елементи или стане грешка, кликаме на безопасна позиция с движение на мишката
-            if (!clickedOnElement) {
-                const vp = page.viewportSize() || { width: 1280, height: 720 };
-                const x = Math.floor(Math.random() * (vp.width - 200)) + 100;
-                const y = Math.floor(Math.random() * (vp.height - 200)) + 100;
-                
-                try {
-                    await page.mouse.move(x, y, { steps: 5 });
-                    await page.mouse.click(x, y);
-                } catch { /* ignore */ }
-                clickLog.push({ n: i + 1, type: 'fallback_coord', x, y, events: (popups + hijacks.length) - before });
-            }
+            } catch { /* ignore */ }
 
             await page.waitForTimeout(waitMs);
         }
