@@ -13,7 +13,7 @@ chromium.use(stealth);
 const PORT = process.env.DEEP_VISIT_PORT || 3001;
 const API_KEY = process.env.DEEP_VISIT_KEY || '';
 const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DEEP_VISIT_MAX_CONCURRENT || '2', 10));
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const UA = process.env.DEEP_VISIT_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const AD_DOMAINS = [
     'doubleclick.net','googlesyndication.com','googleadservices.com','adservice.google.com',
@@ -128,11 +128,15 @@ async function analyze(rawUrl, opts) {
     const url = (await assertSafeUrl(rawUrl)).href;
     const browser = await getBrowser();
 
+    // ТУК Е ПРОМЯНАТА ЗА МОБИЛЕН РЕЖИМ
+    const isMobile = opts.mobile;
     const context = await browser.newContext({
-        userAgent: UA,
-        viewport: { width: 1280, height: 720 },
+        userAgent: isMobile ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1' : UA,
+        viewport: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
         locale: 'en-US',
         ignoreHTTPSErrors: true,
+        isMobile: isMobile,
+        hasTouch: isMobile
     });
 
     const killer = setTimeout(() => context.close().catch(() => {}), 90000);
@@ -222,8 +226,9 @@ async function analyze(rawUrl, opts) {
 
         for (let i = 0; i < clicks; i++) {
             const before = popups + hijacks.length;
-            const x = 120 + Math.floor(Math.random() * (vp.width - 240));
-            const y = 120 + Math.floor(Math.random() * (vp.height - 240));
+            // Коригирахме малко координатите, за да пасват и на тесни мобилни екрани
+            const x = Math.max(20, Math.floor(Math.random() * (vp.width - 100))) + 50;
+            const y = Math.max(20, Math.floor(Math.random() * (vp.height - 100))) + 50;
             try { await page.mouse.click(x, y); } catch { /* ignore */ }
             await page.waitForTimeout(waitMs);
             const after = popups + hijacks.length;
@@ -280,8 +285,10 @@ app.get('/deep-check', auth, async (req, res) => {
     if (!url) return res.status(400).json({ success: false, error: 'Missing URL' });
     const clicks = Math.min(10, Math.max(1, parseInt(req.query.clicks || '5', 10) || 5));
     const waitSec = Math.min(10, Math.max(1, parseFloat(req.query.wait || '2') || 2));
+    const mobile = req.query.mobile === '1'; // ТУК ПРИХВАЩАМЕ mobile=1
+    
     try {
-        const result = await runLimited(() => analyze(String(url), { clicks, waitMs: Math.round(waitSec * 1000) }));
+        const result = await runLimited(() => analyze(String(url), { clicks, waitMs: Math.round(waitSec * 1000), mobile }));
         res.json(result);
     } catch (e) {
         res.json({ success: false, error: e.message });
