@@ -1,15 +1,11 @@
-// deep-visit.js — FSS Deep Visit Worker v2
+// deep-visit.js — FSS Deep Visit Worker v3
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
-// Ключови поправки спрямо v1:
-//  1) Blocklist (EasyList + AdGuard DNS + Peter Lowe, авто-обновяване на 24ч) + seed от известни
-//     Monetag/PropellerAds/Adsterra ротационни домейни; счупената гласна/съгласна DGA евристика е заменена.
-//  2) Реални кликове: scrollIntoView + координати от пресен boundingBox, без повторения;
-//     deep режим: начална страница -> филм -> play -> клик ВЪТРЕ в player iframe-а.
-//  3) Popup-ите не се затварят веднага — проследява се цялата redirect верижка (вкл. about:blank старт).
-//  4) Хуковете са в целия context (всички страници и frames) + маскиран Function.prototype.toString.
-//  5) UA и Client Hints (Sec-CH-UA / navigator.userAgentData) синхронизирани с реалния Chromium.
-//  6) SOCIAL филтър по hostname, не substring; getRootDomain с multi-part TLD; guard активен още при goto.
-//  7) DEEP_VISIT_PROXY — препоръчително резидентен proxy; datacenter IP се филтрира от ad мрежите.
+// v3 поправки спрямо v2:
+//  - Analytics (GA/GTM/Cloudflare Insights) вече НЕ се броят като реклами (isLegitCdn преди blocklist).
+//  - Кликове извън viewport-а (скрито меню x=-250) се отхвърлят; реални touch събития при mobile=1.
+//  - Blocklist: 60s таймаут + огледала (jsDelivr) + статус по източник в /health + логове.
+//  - detail_page_reached се изчислява от финалния URL; допълнителен опит за клик в плейъра.
+//  - По-малък праг за player iframe (160x120) + повече време след Play бутона.
 
 const express = require('express');
 const crypto = require('crypto');
@@ -25,8 +21,8 @@ const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DEEP_VISIT_MAX_CONCURREN
 const PROXY = process.env.DEEP_VISIT_PROXY || '';
 const HEADFUL = process.env.DEEP_VISIT_HEADFUL === '1';
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
+const WORKER_VERSION = 'v3';
 
-// --- Seed: класически + ротационни домейни на Monetag/PropellerAds/Adsterra ---
 const AD_DOMAINS = [
   'doubleclick.net','googlesyndication.com','googleadservices.com','adservice.google.com',
   'popads.net','popcash.net','propellerads.com','propellerpops.com','onclickalgo.com',
@@ -59,7 +55,6 @@ const AD_DOMAINS = [
   'undertone.com','unrulymedia.com','vidoomy.com','vidora.com','vidspring.com',
   'viralize.com','vi-serve.com','vungle.com','yieldbot.com','yieldlab.net',
   'yieldmo.com','yieldoptimizer.com','zemanta.com','zeotap.com','zergnet.com','zorosrv.com',
-  // Ротационни DGA домейни (сричкови — старата евристика ги изпускаше):
   'laiserpeglet.com','nidehetaira.com','ochringptolemy.com','alwingulla.com','betotodilea.com',
   'chooxaur.com','gloaphoo.net','phaurtuh.net','thaudray.com','whephoochi.com','zaubanel.com',
   'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
@@ -89,7 +84,6 @@ const MULTI_TLDS = new Set([
   'com.ph','com.vn','co.id','co.th','or.id','web.id',
 ]);
 
-// Чести думи — ако SLD ги съдържа, НЕ е DGA (защита от фалшиви положителни).
 const COMMON_WORDS = [
   'google','cloud','share','this','font','awesome','media','video','movie','movies','film','play',
   'player','stream','show','watch','free','online','site','page','host','server','data','link',
@@ -115,11 +109,11 @@ const COMMON_WORDS = [
   'wixstatic','squarespace','shopify','bigcommerce','magento','prestashop','opencart','woocommerce',
 ];
 
-// --- Blocklist: зарежда се при старт и на всеки 24ч; при грешка работи със seed-а ---
 const BLOCK_SET = new Set(AD_DOMAINS);
 let blocklistReady = false;
+const blocklistStatus = {};
 
-async function fetchText(url, ms = 25000) {
+async function fetchText(url, ms = 60000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), ms);
   try {
@@ -136,12 +130,15 @@ function addBlockDomain(d) {
 
 async function refreshBlocklists() {
   const sources = [
-    { url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext', fmt: 'hosts' },
-    { url: 'https://easylist.to/easylist/easylist.txt', fmt: 'adblock' },
-    { url: 'https://raw.githubusercontent.com/AdguardTeam/AdGuardSDNSFilter/master/Filters/filter.txt', fmt: 'adblock' },
+    { name: 'peter_lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext', fmt: 'hosts' },
+    { name: 'easylist', url: 'https://easylist.to/easylist/easylist.txt', fmt: 'adblock' },
+    { name: 'easylist_mirror', url: 'https://cdn.jsdelivr.net/gh/easylist/easylist@master/easylist.txt', fmt: 'adblock' },
+    { name: 'adguard_dns', url: 'https://raw.githubusercontent.com/AdguardTeam/AdGuardSDNSFilter/master/Filters/filter.txt', fmt: 'adblock' },
+    { name: 'adguard_mirror', url: 'https://cdn.jsdelivr.net/gh/AdguardTeam/AdGuardSDNSFilter@master/Filters/filter.txt', fmt: 'adblock' },
   ];
   let ok = 0;
   for (const s of sources) {
+    const before = BLOCK_SET.size;
     try {
       const txt = await fetchText(s.url);
       for (const line of txt.split('\n')) {
@@ -154,16 +151,21 @@ async function refreshBlocklists() {
           if (m) addBlockDomain(m[1]);
         }
       }
+      const added = BLOCK_SET.size - before;
+      blocklistStatus[s.name] = { ok: true, added, bytes: txt.length, ts: Date.now() };
+      console.log('[deep-visit] blocklist OK:', s.name, '+' + added, '(total ' + BLOCK_SET.size + ')');
       ok++;
-    } catch (e) { console.error('[deep-visit] blocklist fetch failed:', s.url, '-', e.message); }
+    } catch (e) {
+      blocklistStatus[s.name] = { ok: false, error: String(e.message || e).slice(0, 120), ts: Date.now() };
+      console.error('[deep-visit] blocklist FAIL:', s.name, '-', String(e.message || e).slice(0, 120));
+    }
   }
   blocklistReady = ok > 0;
-  console.log('[deep-visit] blocklist domains:', BLOCK_SET.size);
+  console.log('[deep-visit] blocklist domains total:', BLOCK_SET.size);
 }
 refreshBlocklists().catch(() => {});
 setInterval(() => refreshBlocklists().catch(() => {}), BLOCKLIST_TTL_MS).unref();
 
-// --- Помощни ---
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));
   const y = Buffer.from(String(b));
@@ -234,10 +236,10 @@ function adDomainMatch(urlStr) {
     const h = u.hostname.toLowerCase();
     if (!h) return null;
     for (const ad of AD_DOMAINS) if (h === ad || h.endsWith('.' + ad)) return ad;
+    if (isLegitCdn(h)) return null; // analytics/CDN не са реклами (v3 fix)
     return blocklistMatch(h);
   } catch { return null; }
 }
-// Новата евристика: дълъг SLD без нито една честа дума -> съмнителен (не "потвърден").
 function looksLikeDga(host) {
   const sld = getRootDomain(host).split('.')[0];
   if (!sld || sld.length < 8 || !/^[a-z0-9-]+$/.test(sld)) return false;
@@ -245,7 +247,6 @@ function looksLikeDga(host) {
   return true;
 }
 
-// --- Browser singleton ---
 let browserPromise = null;
 function getBrowser() {
   if (!browserPromise) {
@@ -259,6 +260,7 @@ function getBrowser() {
       ],
     };
     if (PROXY) opts.proxy = { server: PROXY };
+    if (process.env.DEEP_VISIT_EXECUTABLE) opts.executablePath = process.env.DEEP_VISIT_EXECUTABLE;
     browserPromise = chromium.launch(opts).then((b) => {
       b.on('disconnected', () => { browserPromise = null; });
       return b;
@@ -282,7 +284,6 @@ async function runLimited(fn) {
   try { return await fn(); } finally { release(); }
 }
 
-// Синхронизира UA + Client Hints с реалната версия на браузъра (няма Chrome/124 mismatch).
 async function syncClientHints(p, ua, isMobile, fullVer) {
   try {
     const major = String(fullVer).split('.')[0];
@@ -308,7 +309,6 @@ async function syncClientHints(p, ua, isMobile, fullVer) {
         mobile: !!isMobile,
       },
     });
-    // Сесията НЕ се detach-ва — override живее в нея; context.close() я почиства.
   } catch { /* ignore */ }
 }
 
@@ -355,7 +355,6 @@ async function analyze(rawUrl, opts) {
   let page;
 
   try {
-    // Хукове в ЦЕЛИЯ context — всяка страница и frame, включително popup-ите.
     await context.addInitScript(() => {
       try {
         const nativeToString = Function.prototype.toString;
@@ -420,8 +419,6 @@ async function analyze(rawUrl, opts) {
     page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
     page.on('download', () => { downloads++; });
 
-    // Guard от самото начало: load-phase redirect-и се записват като верижки,
-    // interact-phase redirect-и извън root домейна = hijack.
     page.on('framenavigated', (fr) => {
       if (fr !== page.mainFrame()) return;
       const u = fr.url();
@@ -441,7 +438,6 @@ async function analyze(rawUrl, opts) {
       }
     });
 
-    // Popup tracking: НЕ затваряме веднага — чакаме redirect верижката да се развие.
     context.on('page', async (p) => {
       if (p === page) return;
       popupsOpened++;
@@ -512,7 +508,7 @@ async function analyze(rawUrl, opts) {
     } catch (err) {
       navError = String(err.message || err).split('\n')[0];
     }
-    await sleep(4000); // време на ad скриптовете да се инициализират
+    await sleep(4000);
     phase = 'interact';
 
     const title = await page.title().catch(() => '');
@@ -553,22 +549,31 @@ async function analyze(rawUrl, opts) {
       hasM3u8 = /\.m3u8|\.mpd/.test(info.h);
     } catch (_) {}
 
-    // --- Кликове: реални, без повторения, с приоритет на монетизираните повърхности ---
     const total = Math.min(10, Math.max(1, opts.clicks));
     const waitMs = Math.max(1000, opts.waitMs);
     const clickedSigs = new Set();
     let performed = 0;
     const rawBad = () => popupsOpened + hijackUrls.length + downloads;
 
+    async function tapOrClick(x, y) {
+      if (isMobile) {
+        await page.touchscreen.tap(x, y);
+      } else {
+        await page.mouse.move(x, y, { steps: 5 });
+        await page.mouse.click(x, y);
+      }
+    }
+
     async function clickHandle(h) {
       try { await h.scrollIntoViewIfNeeded({ timeout: 2000 }); } catch (_) {}
       let box = null;
       try { box = await h.boundingBox(); } catch (_) {}
       if (box) {
+        const vp = page.viewportSize() || { width: 1280, height: 720 };
         const x = box.x + box.width / 2;
         const y = box.y + box.height / 2;
-        await page.mouse.move(x, y, { steps: 5 });
-        await page.mouse.click(x, y);
+        if (x < 0 || y < 0 || x >= vp.width || y >= vp.height) return null; // off-canvas -> пропуск
+        await tapOrClick(x, y);
         return { x: Math.round(x), y: Math.round(y) };
       }
       try { await h.click({ timeout: 2500 }); } catch (_) {}
@@ -589,21 +594,48 @@ async function analyze(rawUrl, opts) {
       return ok;
     }
 
-    // 1) Център на страницата (хваща transparent overlay popunder-и)
+    async function clickPlayerIframe(k) {
+      let handles = await page.$$('iframe');
+      if (!handles.length) { await sleep(2500); handles = await page.$$('iframe'); }
+      let bestH = null, bestArea = 0;
+      for (const h of handles) {
+        try {
+          const box = await h.boundingBox();
+          if (!box || box.width < 160 || box.height < 120) continue;
+          if (box.width * box.height > bestArea) { bestArea = box.width * box.height; bestH = h; }
+        } catch (_) {}
+      }
+      if (!bestH) return null;
+      try { await bestH.scrollIntoViewIfNeeded({ timeout: 2000 }); } catch (_) {}
+      const box = await bestH.boundingBox().catch(() => null);
+      if (!box) return null;
+      const vp = page.viewportSize() || { width: 1280, height: 720 };
+      const x = box.x + box.width / 2 + (k ? 20 : 0);
+      const y = box.y + box.height / 2 + (k ? 10 : 0);
+      if (x < 0 || y < 0 || x >= vp.width || y >= vp.height) return null;
+      await tapOrClick(x, y);
+      playerClicked = true;
+      return { x: Math.round(x), y: Math.round(y) };
+    }
+
+    // 1) Център на страницата
     await doStep('center_probe', async () => {
       const vp = page.viewportSize() || { width: 1280, height: 720 };
       const x = vp.width / 2 + (Math.random() * 30 - 15);
       const y = vp.height / 2 + (Math.random() * 30 - 15);
-      await page.mouse.move(x, y, { steps: 6 });
-      await page.mouse.down();
-      await sleep(60);
-      await page.mouse.up();
+      if (isMobile) {
+        await page.touchscreen.tap(x, y);
+      } else {
+        await page.mouse.move(x, y, { steps: 6 });
+        await page.mouse.down();
+        await sleep(60);
+        await page.mouse.up();
+      }
       return { x: Math.round(x), y: Math.round(y) };
     });
 
     if (opts.deep) {
-      // 2) Клик към страница на филм/сериал (където живеят popunder-ите)
-      const urlBefore = page.url();
+      // 2) Към страница на филм/сериал
       await doStep('content_link', async () => {
         const pick = await page.evaluate((host) => {
           const bad = /\/(genre|country|login|register|filter|search|tag|actor|director|year|type|page|privacy|terms|dmca|contact)\b/i;
@@ -617,6 +649,7 @@ async function analyze(rawUrl, opts) {
               if (u.hostname !== host || bad.test(u.pathname) || u.pathname.length < 4) continue;
               const r = a.getBoundingClientRect();
               if (r.width < 40 || r.height < 30) continue;
+              if (r.left < 0 || r.right > window.innerWidth + 1) continue; // скрито меню
               let s = 0;
               if (good.test(u.pathname)) s += 3;
               if (a.querySelector('img')) s += 2;
@@ -633,10 +666,7 @@ async function analyze(rawUrl, opts) {
         clickedSigs.add(pick.sig);
         return await clickHandle(h);
       });
-      await sleep(1500);
-      try {
-        detailReached = page.url() !== urlBefore && getRootDomain(new URL(page.url()).hostname) === startRoot;
-      } catch (_) {}
+      await sleep(2000);
 
       // 3) Play / Watch бутон
       const PLAY_SEL = 'a, button, [role="button"], [class*="play"], [class*="watch"], [class*="btn"]';
@@ -649,6 +679,7 @@ async function analyze(rawUrl, opts) {
               const el = els[i];
               const r = el.getBoundingClientRect();
               if (r.width < 30 || r.height < 20) continue;
+              if (r.left < 0 || r.right > window.innerWidth + 1) continue;
               const t = (el.innerText || '').trim().toLowerCase();
               const cls = String(el.className || '').toLowerCase();
               const href = (el.getAttribute('href') || '').toLowerCase();
@@ -668,37 +699,21 @@ async function analyze(rawUrl, opts) {
         clickedSigs.add(pick.sig);
         return await clickHandle(h);
       });
-      await sleep(2500); // player-ът да се зареди
+      await sleep(3000); // повече време за зареждане на плейъра
 
-      // 4+5) Клик ВЪТРЕ в player iframe-а (там е най-агресивният popunder код)
+      // 4+5) Кликове в player iframe-а
       for (let k = 0; k < 2 && performed < total; k++) {
-        const done = await doStep(k === 0 ? 'player_iframe_click' : 'player_iframe_click2', async () => {
-          let handles = await page.$$('iframe');
-          if (!handles.length && k === 0) { await sleep(2500); handles = await page.$$('iframe'); }
-          let bestH = null, bestArea = 0;
-          for (const h of handles) {
-            try {
-              const box = await h.boundingBox();
-              if (!box || box.width < 200 || box.height < 150) continue;
-              if (box.width * box.height > bestArea) { bestArea = box.width * box.height; bestH = h; }
-            } catch (_) {}
-          }
-          if (!bestH) return null;
-          try { await bestH.scrollIntoViewIfNeeded({ timeout: 2000 }); } catch (_) {}
-          const box = await bestH.boundingBox().catch(() => null);
-          if (!box) return null;
-          const x = box.x + box.width / 2 + (k ? 20 : 0);
-          const y = box.y + box.height / 2 + (k ? 10 : 0);
-          await page.mouse.move(x, y, { steps: 6 });
-          await page.mouse.click(x, y);
-          playerClicked = true;
-          return { x: Math.round(x), y: Math.round(y) };
-        });
+        const done = await doStep(k === 0 ? 'player_iframe_click' : 'player_iframe_click2', () => clickPlayerIframe(k));
         if (!done && k === 0) break;
+      }
+
+      // Допълнителен опит, ако плейърът още не е кликнат
+      if (!playerClicked && performed < total) {
+        await doStep('player_iframe_retry', () => clickPlayerIframe(0));
       }
     }
 
-    // Останал бюджет: филтрирани елементи, без повторения, със scroll
+    // Останал бюджет: филтрирани елементи
     const FILTER_SEL = 'a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]';
     while (performed < total && Date.now() - t0 < 115000) {
       await doStep('filtered_element', async () => {
@@ -720,6 +735,7 @@ async function analyze(rawUrl, opts) {
               if (/share|social|login|register|bookmark/i.test(cls)) continue;
               const r = el.getBoundingClientRect();
               if (r.width < 25 || r.height < 20) continue;
+              if (r.left < 0 || r.right > window.innerWidth + 1) continue;
               const sig = el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + (el.innerText || '').trim().slice(0, 30);
               if (skip.includes(sig)) continue;
               cands.push({ idx: i, sig });
@@ -732,8 +748,7 @@ async function analyze(rawUrl, opts) {
           const vp = page.viewportSize() || { width: 1280, height: 720 };
           const x = Math.floor(vp.width * (0.25 + Math.random() * 0.5));
           const y = Math.floor(vp.height * (0.25 + Math.random() * 0.5));
-          await page.mouse.move(x, y, { steps: 5 });
-          await page.mouse.click(x, y);
+          await tapOrClick(x, y);
           return { x, y };
         }
         const handles = await page.$$(FILTER_SEL);
@@ -744,9 +759,8 @@ async function analyze(rawUrl, opts) {
       });
     }
 
-    await sleep(3000); // късни popunder-и / redirect-и да се довършат
+    await sleep(3000);
 
-    // Освежи video/iframe флаговете след deep навигацията
     try {
       const late = await page.evaluate(() => ({
         v: document.querySelectorAll('video').length,
@@ -756,7 +770,10 @@ async function analyze(rawUrl, opts) {
       hasIframe = hasIframe || late.i > 0;
     } catch (_) {}
 
-    // Събери JS hook резултатите от ВСИЧКИ страници и frames (вкл. player iframe-а)
+    try {
+      detailReached = detailReached || /\/(movie|movies|tv|watch|film|series|episode|anime|drama)/i.test(new URL(page.url()).pathname);
+    } catch (_) {}
+
     for (const p of context.pages()) {
       for (const fr of p.frames()) {
         try {
@@ -780,8 +797,6 @@ async function analyze(rawUrl, opts) {
       dedupInt.filter((x) => !x.url.startsWith('about:')).map((x) => x.url)
     ).size;
 
-    // Ефективни popup-и: изключваме само тези, които са отишли единствено към социални мрежи.
-    // about:blank-only таб също се брои (блокиран/незавършил popunder).
     const effectivePopups = popupRecords.filter((r) => {
       const real = r.urls.filter((u) => u && u !== 'about:blank');
       if (!real.length) return true;
@@ -820,6 +835,7 @@ async function analyze(rawUrl, opts) {
 
     return {
       success: true,
+      worker_version: WORKER_VERSION,
       url,
       detected_stack: techStack,
       status: isCfChallenge ? 'blocked' : (navError ? 'error' : 'loaded'),
@@ -868,8 +884,10 @@ async function analyze(rawUrl, opts) {
 
 const app = express();
 app.get('/health', (_req, res) => res.json({
-  ok: true, service: 'deep-visit', active, queued: waiters.length,
+  ok: true, service: 'deep-visit', version: WORKER_VERSION,
+  active, queued: waiters.length,
   blocklist_domains: BLOCK_SET.size, blocklist_ready: blocklistReady,
+  blocklist_sources: blocklistStatus,
 }));
 app.get('/deep-check', auth, async (req, res) => {
   const url = req.query.url;
@@ -893,6 +911,6 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('[deep-visit] v2 on port ' + PORT + ' (max concurrent: ' + MAX_CONCURRENT + ')' +
-    (API_KEY ? '' : ' — WARNING: no key set') + (PROXY ? ' — proxy: ' + PROXY : ' — no proxy (datacenter IP може да се филтрира от ad мрежите)'));
+  console.log('[deep-visit] ' + WORKER_VERSION + ' on port ' + PORT + ' (max concurrent: ' + MAX_CONCURRENT + ')' +
+    (API_KEY ? '' : ' — WARNING: no key set') + (PROXY ? ' — proxy: ' + PROXY : ' — no proxy'));
 });
