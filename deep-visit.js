@@ -1,4 +1,4 @@
-// deep-visit.js — FSS Deep Visit Worker (Advanced Hybrid Edition with DGA & Safe Bounds)
+// deep-visit.js — FSS Deep Visit Worker (Advanced DGA SLD Detection Edition)
 const express = require('express');
 const crypto = require('crypto');
 const dns = require('dns').promises;
@@ -46,10 +46,9 @@ const AD_DOMAINS = [
 const CF_RE = /just a moment|verifying you are human|verify you are human|checking your browser|attention required/i;
 const SOCIAL_RE = /facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me|telegram\.me|whatsapp\.com|reddit\.com|pinterest\.com|mailto:|javascript:/i;
 
-// Известни легитимни CDN/услуги, които да изключим от подозрителните DGA домейни
 const LEGIT_CDNS = [
     'cloudflare.com', 'jsdelivr.net', 'googletagmanager.com', 'google-analytics.com',
-    'gstatic.com', 'bootstrapcdn.com', 'jquery.com', 'sharethis.com', 'whatsapp.net'
+    'gstatic.com', 'bootstrapcdn.com', 'jquery.com', 'sharethis.com', 'whatsapp.net', 'google.com'
 ];
 
 function safeEqual(a, b) {
@@ -143,16 +142,15 @@ function adDomainMatch(urlStr) {
             if (h === ad || h.endsWith('.' + ad)) return ad;
         }
 
-        // 2. Детекция на динамични/генерирани домейни (DGA) за реклами/попъндъри
-        // Характерно за стрийминг сайтовете е да ползват поддомейни от тип случайни думи (напр. fo.ochringptolemy.com)
+        // 2. Усъвършенствано ДГАС откриване по основното име на домейна (SLD)
+        // Пример: fo.ochringptolemy.com -> root е ochringptolemy.com, а SLD е ochringptolemy
         if (!isLegitCdn(h)) {
-            const parts = h.split('.');
-            if (parts.length >= 3) {
-                const sub = parts[0];
-                // Ако поддомейнът е с дължина над 6 символа и изглежда като случаен сбор от букви (без типични думи като www, api, static)
-                if (sub.length >= 6 && !/^(www|api|cdn|static|assets|img|video|stream|player|embed)$/.test(sub)) {
-                    return h; // Връщаме го като засечен съмнителен домен
-                }
+            const root = getRootDomain(h);
+            const sld = root.split('.')[0]; // Взимаме частта преди .com/.net
+            
+            // Ако основното име е дълго (над 9 символа) и съдържа дълги слети думи без стандартна структура
+            if (sld && sld.length >= 9 && /[aeiou]{3,}|[^aeiou]{4,}/i.test(sld)) {
+                return h; 
             }
         }
     } catch { /* ignore */ }
@@ -417,7 +415,6 @@ async function analyze(rawUrl, opts) {
                         await page.mouse.click(safeTarget.x, safeTarget.y);
                         clickLog.push({ n: i + 1, type: 'filtered_element', x: Math.round(safeTarget.x), y: Math.round(safeTarget.y), events: (popups + hijacks.length) - before });
                     } else {
-                        // Строго гарантираме x > 0 (вътре в екрана)
                         const x = Math.floor(Math.random() * (vp.width * 0.5)) + (vp.width * 0.25);
                         const y = Math.floor(Math.random() * (vp.height * 0.5)) + (vp.height * 0.25);
                         await page.mouse.move(x, y, { steps: 6 });
