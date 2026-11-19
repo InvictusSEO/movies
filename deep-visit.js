@@ -26,7 +26,7 @@
 //      DEEP_VISIT_ROUNDS (по подразбиране 2), DEEP_VISIT_UA, DEEP_VISIT_EXECUTABLE,
 //      DEEP_VISIT_ALLOW_QUERY_KEY=0 (приема ключ само в хедър x-api-key), DEEP_VISIT_EXTRA_ARGS (през запетая).
 //
-// API: GET /deep-check?url=...&clicks=6&wait=2.5&mobile=0|1&deep=1|0&rounds=1..3&play_url=...
+// API: GET /deep-check?url=...&clicks=6&wait=2.5&mobile=0|1&deep=1|0&rounds=1..3&play_url=...&debug=1
 
 const express = require('express');
 const crypto = require('crypto');
@@ -554,6 +554,7 @@ async function analyze(rawUrl, opts) {
     techStack: 'unknown',
     hasVideo: false, hasIframe: false, hasM3u8: false,
     overlays: 0,
+    debug: [],
   };
   const roundsInfo = [];
   const maxRounds = opts.deep ? Math.min(3, Math.max(1, opts.rounds || DEFAULT_ROUNDS)) : 1;
@@ -845,6 +846,25 @@ async function analyze(rawUrl, opts) {
         refreshDetail();
       }
 
+      async function snap(label) {
+        if (!opts.debug || S.debug.length >= 10) return;
+        try {
+          const d = await page.evaluate(() => {
+            const cut = (x, n) => String(x || '').replace(/\s+/g, ' ').trim().slice(0, n);
+            const box = (el) => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el); return { w: Math.round(r.width), h: Math.round(r.height), y: Math.round(r.top + scrollY), vis: st.visibility !== 'hidden' && st.display !== 'none' }; };
+            return {
+              iframes: Array.from(document.querySelectorAll('iframe')).slice(0, 10).map((f) => ({ src: cut(f.src || f.getAttribute('src') || f.getAttribute('data-src'), 120), ...box(f) })),
+              videos: document.querySelectorAll('video').length,
+              player_like: Array.from(document.querySelectorAll('[id*="player" i], [class*="player" i]')).slice(0, 8).map((e) => ({ tag: e.tagName.toLowerCase(), id: cut(e.id, 30), cls: cut(e.className, 50), ...box(e) })),
+              buttons: Array.from(document.querySelectorAll('a, button, [role="button"]')).filter((e) => /play|watch|server|episode|season|стрийм|▶/i.test((e.innerText || '') + ' ' + (e.className || ''))).slice(0, 14)
+                .map((e) => ({ tag: e.tagName.toLowerCase(), text: cut(e.innerText, 30), href: cut(e.getAttribute('href'), 70), cls: cut(e.className, 40), ...box(e) })),
+              text: cut(document.body ? document.body.innerText : '', 250),
+            };
+          });
+          S.debug.push({ label, round: idx + 1, url: page.url().slice(0, 140), ...d });
+        } catch (_) {}
+      }
+
       async function findPlayerCandidate() {
         const list = await page.evaluate((sel) => {
           const vw = window.innerWidth, vh = window.innerHeight, res = [];
@@ -854,7 +874,7 @@ async function analyze(rawUrl, opts) {
               const el = els[i];
               if (el.closest('header, nav, footer')) continue;
               const r = el.getBoundingClientRect();
-              if (r.width < 300 || r.height < 170) continue;
+              if (r.width < 220 || r.height < 120) continue;
               if (r.width >= vw * 0.98 && r.height >= vh * 1.6) continue;
               const st = getComputedStyle(el);
               if (st.visibility === 'hidden' || st.display === 'none') continue;
@@ -1041,7 +1061,7 @@ async function analyze(rawUrl, opts) {
             break;
           }
           // Плейърът може да се зареди със закъснение
-          if (lateWaitFor !== cur) { lateWaitFor = cur; await sleep(2500); continue; }
+          if (lateWaitFor !== cur) { lateWaitFor = cur; await sleep(2500); await snap('no_player_after_wait'); continue; }
           if (navClicks < 4) {
             if (await step('play_button', findPlayButton)) { navClicks++; await sleep(1500); continue; }
             if (!S.detailReached || navClicks === 0) {
@@ -1059,6 +1079,7 @@ async function analyze(rawUrl, opts) {
         }
       }
 
+      await snap('round_end');
       await sleep(4000);
 
       // Късна информация
@@ -1238,6 +1259,7 @@ async function analyze(rawUrl, opts) {
         rounds_planned: maxRounds,
       },
       rounds: roundsInfo,
+      debug: opts.debug ? S.debug : undefined,
       evidence: {
         popup_urls: popupUrls.slice(0, 10),
         popup_details: S.popupRecords.slice(0, 10).map((r) => ({ phase: r.phase, round: r.round, urls: r.urls.slice(0, 6) })),
@@ -1274,9 +1296,10 @@ function buildApp() {
     const deep = req.query.deep !== '0';
     const rounds = Math.min(3, Math.max(1, parseInt(req.query.rounds || String(DEFAULT_ROUNDS), 10) || DEFAULT_ROUNDS));
     const playUrl = req.query.play_url ? String(req.query.play_url) : '';
+    const debug = req.query.debug === '1';
     try {
       const result = await runLimited(() => analyze(String(url), {
-        clicks, waitMs: Math.round(waitSec * 1000), mobile, deep, rounds, playUrl,
+        clicks, waitMs: Math.round(waitSec * 1000), mobile, deep, rounds, playUrl, debug,
       }));
       res.json(result);
     } catch (e) {
