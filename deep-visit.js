@@ -342,6 +342,7 @@ function trackerDomainMatch(urlStr) {
 }
 // Само информативно (не точкува).
 function looksLikeDga(host) {
+  if (!String(host || '').includes('.')) return false; // напр. id на разширение
   const sld = getRootDomain(host).split('.')[0];
   if (!sld || sld.length < 8 || !/^[a-z0-9-]+$/.test(sld)) return false;
   for (const w of COMMON_WORDS) if (w.length >= 3 && sld.includes(w)) return false;
@@ -509,6 +510,26 @@ const CF_RE = /just a moment|verifying you are human|verify you are human|checki
 const PLAYER_SEL = 'video, iframe, [id*="player" i], [class*="player" i], [class*="jwplayer"], [class*="video-js"], [class*="plyr"], [class*="dplayer"], [id*="video" i]';
 const PLAY_SEL = 'a, button, [role="button"], [class*="play"], [class*="watch"], [class*="btn"]';
 const FILTER_SEL = 'a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]';
+
+// Прозрачни/външни слоеве върху над 50% от екрана (типично за popunder "маски")
+function countOverlays() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let overlays = 0;
+  for (const el of document.querySelectorAll('div, a, iframe')) {
+    try {
+      const st = window.getComputedStyle(el);
+      const z = parseInt(st.zIndex, 10) || 0;
+      if (!(st.position === 'fixed' || st.position === 'absolute') || z <= 999) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width * r.height < vw * vh * 0.5) continue;
+      const external = el.tagName === 'A' && el.hostname && el.hostname !== location.hostname;
+      const transparent = parseFloat(st.opacity) <= 0.05 ||
+        (/rgba\(0, 0, 0, 0\)|transparent/.test(st.backgroundColor) && st.cursor === 'pointer');
+      if (external || el.tagName === 'IFRAME' || transparent) overlays++;
+    } catch (_) {}
+  }
+  return overlays;
+}
 
 async function analyze(rawUrl, opts) {
   const t0 = Date.now();
@@ -753,25 +774,10 @@ async function analyze(rawUrl, opts) {
             const html = document.documentElement.outerHTML.slice(0, 250000);
             const isNextOrReact = Boolean(document.getElementById('__next') || document.getElementById('root') ||
               window.__NEXT_DATA__ || document.querySelector('[data-reactroot]'));
-            const vw = window.innerWidth, vh = window.innerHeight;
-            let overlays = 0;
-            for (const el of document.querySelectorAll('div, a, iframe')) {
-              try {
-                const st = window.getComputedStyle(el);
-                const z = parseInt(st.zIndex, 10) || 0;
-                if (!(st.position === 'fixed' || st.position === 'absolute') || z <= 999) continue;
-                const r = el.getBoundingClientRect();
-                if (r.width * r.height < vw * vh * 0.5) continue;
-                const external = el.tagName === 'A' && el.hostname && el.hostname !== location.hostname;
-                const transparent = parseFloat(st.opacity) <= 0.05 ||
-                  (/rgba\(0, 0, 0, 0\)|transparent/.test(st.backgroundColor) && st.cursor === 'pointer');
-                if (external || el.tagName === 'IFRAME' || transparent) overlays++;
-              } catch (_) {}
-            }
-            return { isNextOrReact, overlays, v: document.querySelectorAll('video').length, i: document.querySelectorAll('iframe').length, h: html };
+            return { isNextOrReact, v: document.querySelectorAll('video').length, i: document.querySelectorAll('iframe').length, h: html };
           });
           S.techStack = pageInfo.isNextOrReact ? 'spa_react_next' : 'classic_ssr_php';
-          S.overlays = Math.min(3, pageInfo.overlays);
+          S.overlays = Math.min(3, await page.evaluate(countOverlays).catch(() => 0));
           S.hasVideo = pageInfo.v > 0;
           S.hasIframe = pageInfo.i > 0;
           S.hasM3u8 = /\.m3u8|\.mpd/.test(pageInfo.h);
@@ -1080,6 +1086,7 @@ async function analyze(rawUrl, opts) {
       }
 
       await snap('round_end');
+      try { S.overlays = Math.max(S.overlays, Math.min(3, await page.evaluate(countOverlays))); } catch (_) {}
       await sleep(4000);
 
       // Късна информация
@@ -1200,6 +1207,7 @@ async function analyze(rawUrl, opts) {
     if (confidence === 'none') verdict = 'blocked_or_failed';
     else if (score >= 10) verdict = 'ads_detected';
     else if (inconclusive) verdict = 'inconclusive';
+    else if (S.adHosts.size >= 1 && popups === 0 && notes.includes('ad_scripts_present_but_no_popups_headless_suppression_possible')) verdict = 'ads_scripts_present';
     else verdict = 'clean_or_light';
 
     const totalAdHits = Array.from(S.adHosts.values()).reduce((a, b) => a + b, 0);
