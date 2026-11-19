@@ -91,6 +91,23 @@ const AD_DOMAINS = [
   'uuidksinc.net','new-programmatic.com','liftdsp.com',
 ];
 
+// Мрежи, чийто основен продукт са popunder / onclick / push реклами. Зареден скрипт от такава мрежа
+// е сам по себе си доказателство за реклами, дори в тестовата среда те да не се задействат.
+const POPUNDER_DOMAINS = [
+  'popads.net','popcash.net','propellerads.com','propellerpops.com','onclickalgo.com','onclickmax.com',
+  'onclckds.com','onclckpro.com','onclckstr.com','onclckinp.com','onclckmetrics.com',
+  'profitablecpmrate.com','profitableratecpm.com','adsterra.com','displayformatcontent.com',
+  'displayformatrevenue.com','effectiveratecpm.com','effectivegatecpm.com','highratecpm.com',
+  'profitablegatecpm.com','revenuecpmgate.com','toprevenuegate.com','trustedgatetocontent.com',
+  'exoclick.com','exosrv.com','juicyads.com','trafficjunky.com','clickadu.com','adcash.com',
+  'monetag.com','ad-maven.com','hilltopads.net','adnium.com','exdynsrv.com','tsyndicate.com',
+  'laiserpeglet.com','nidehetaira.com','ochringptolemy.com','alwingulla.com','betotodilea.com',
+  'chooxaur.com','gloaphoo.net','phaurtuh.net','thaudray.com','whephoochi.com','zaubanel.com',
+  'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
+  'diketime.com','bytogeticr.com','wpadmngr.com','nawpush.com','capndr.com','ntvpforever.com',
+  'cabnnr.com','metricswpsh.com','uuidksinc.net',
+];
+
 const LEGIT_CDNS = [
   'cloudflare.com','cdnjs.cloudflare.com','jsdelivr.net','googletagmanager.com','google-analytics.com',
   'gstatic.com','googleapis.com','ggpht.com','bootstrapcdn.com','jquery.com','sharethis.com',
@@ -328,6 +345,11 @@ function adMatchHost(h) {
   if (setMatch(ALLOW_SET, h)) return null;
   return hit;
 }
+function popunderMatchHost(h) {
+  if (!h) return null;
+  for (const d of POPUNDER_DOMAINS) if (h === d || h.endsWith('.' + d)) return d;
+  return null;
+}
 function trackerMatchHost(h) {
   if (!h || isLegitCdn(h)) return null;
   const hit = setMatch(TRACKER_SET, h);
@@ -560,7 +582,9 @@ async function analyze(rawUrl, opts) {
     unknownHosts: new Set(),
     adHosts: new Map(),       // домейн -> брой заявки (само от основната страница)
     trackerHosts: new Map(),
-    adNavHosts: new Map(),    // реклами, към които водят popup/пренасочване
+    adNavHosts: new Map(),
+    popunderHosts: new Map(), // popunder мрежи, заредени на страницата
+    adResponses: [],          // какво връщат рекламните скриптове (за диагностика на IP/headless блокиране)    // реклами, към които водят popup/пренасочване
     clickLog: [],
     downloads: 0,
     siteRoots: new Set([startRoot]),
@@ -692,7 +716,7 @@ async function analyze(rawUrl, opts) {
           const host = u.hostname.toLowerCase();
           if (!host) return;
           const ad = adMatchHost(host);
-          if (ad) { bump(S.adHosts, ad); }
+          if (ad) { bump(S.adHosts, ad); const pu = popunderMatchHost(host); if (pu) bump(S.popunderHosts, pu); }
           else {
             const tr = trackerMatchHost(host);
             if (tr) bump(S.trackerHosts, tr);
@@ -707,6 +731,13 @@ async function analyze(rawUrl, opts) {
       });
 
       context.on('response', (res) => {
+        try {
+          const ru = new URL(res.url());
+          if (S.adResponses.length < 16 && adMatchHost(ru.hostname.toLowerCase())) {
+            const h = res.headers();
+            S.adResponses.push({ host: ru.hostname, path: (ru.pathname + ru.search).slice(0, 60), status: res.status(), type: String(h['content-type'] || '').slice(0, 40), len: h['content-length'] || null });
+          }
+        } catch (_) {}
         try {
           const status = res.status();
           if (status < 300 || status >= 400) return;
@@ -1207,7 +1238,8 @@ async function analyze(rawUrl, opts) {
     const adRedirects = dedupRed.filter((x) => x.src === 'page' && (adDomainMatch(x.to) || adDomainMatch(x.from)));
     const uniqueRedirects = new Set(adRedirects.map((x) => x.to)).size;
 
-    const adHostCount = Math.min(15, S.adHosts.size);
+    const popunderCount = Math.min(2, S.popunderHosts.size);
+    const adHostCount = Math.min(15, Math.max(0, S.adHosts.size - S.popunderHosts.size));
     const trackerCount = Math.min(8, S.trackerHosts.size);
     const extraJs = Math.max(0, uniqueJsOpens - popups);
     const breakdown = {
@@ -1216,6 +1248,7 @@ async function analyze(rawUrl, opts) {
       js_opens_beyond_popups: extraJs * 4,
       ad_redirects: uniqueRedirects * 3,
       overlays: S.overlays * 2,
+      popunder_network_hosts: popunderCount * 8,
       unique_ad_hosts: adHostCount,
       unique_tracker_hosts: Math.floor(trackerCount * 0.5),
       downloads: S.downloads * 5,
@@ -1225,25 +1258,26 @@ async function analyze(rawUrl, opts) {
     if (score >= 30) level = 'high';
     else if (score >= 10) level = 'medium';
     else if (score >= 1) level = 'low';
+    // Зареден скрипт от popunder мрежа = най-малко "medium" (реалните посетители ги получават)
+    if (S.popunderHosts.size > 0 && (level === 'none' || level === 'low')) level = 'medium';
 
     // Колко е убедителен тестът
     const notes = [];
     if (S.cfChallenge) notes.push('cf_blocked');
     if (!S.loaded && !S.cfChallenge) notes.push('page_not_loaded');
     if (S.loaded && !S.playerClicked) notes.push('player_not_reached');
-    if (S.playerClicked && popups === 0 && S.adHosts.size > 0 && browserMode !== 'headful') {
-      notes.push('ad_scripts_present_but_no_popups_headless_suppression_possible');
-    }
+    const silentAds = S.playerClicked && popups === 0 && S.hijackUrls.length === 0 && S.adHosts.size > 0;
+    if (silentAds) notes.push('ad_scripts_loaded_but_no_activity_environment_may_suppress_them');
     let confidence = 'high';
     if (S.cfChallenge || !S.loaded) confidence = 'none';
     else if (!S.playerClicked) confidence = 'low';
-    else if (S.playerClicked && popups === 0 && S.adHosts.size > 0 && browserMode !== 'headful') confidence = 'medium';
+    else if (silentAds) confidence = 'medium';
     const inconclusive = confidence === 'none' || (confidence === 'low' && score < 10);
     let verdict;
     if (confidence === 'none') verdict = 'blocked_or_failed';
-    else if (score >= 10) verdict = 'ads_detected';
+    else if (popups > 0 || S.hijackUrls.length > 0 || score >= 10) verdict = 'ads_detected';
+    else if (S.adHosts.size >= 1 && !(S.playerClicked === false && S.popunderHosts.size === 0)) verdict = 'ads_scripts_present';
     else if (inconclusive) verdict = 'inconclusive';
-    else if (S.adHosts.size >= 1 && popups === 0 && notes.includes('ad_scripts_present_but_no_popups_headless_suppression_possible')) verdict = 'ads_scripts_present';
     else verdict = 'clean_or_light';
 
     const totalAdHits = Array.from(S.adHosts.values()).reduce((a, b) => a + b, 0);
@@ -1290,6 +1324,8 @@ async function analyze(rawUrl, opts) {
       ad_score: score,
       ad_level: level,
       score_breakdown: breakdown,
+      popunder_networks: Array.from(S.popunderHosts.keys()),
+      ad_responses: S.adResponses,
       inconclusive,
       confidence,
       verdict,
@@ -1370,5 +1406,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = { analyze, buildApp, parseListLine, adMatchHost, trackerMatchHost, hostAllowed, assertSafeUrl,
+module.exports = { popunderMatchHost, analyze, buildApp, parseListLine, adMatchHost, trackerMatchHost, hostAllowed, assertSafeUrl,
   looksLikeDga, getRootDomain, AD_SET, TRACKER_SET, ALLOW_SET, isPrivateIp };
