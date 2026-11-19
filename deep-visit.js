@@ -27,6 +27,7 @@
 //      DEEP_VISIT_ALLOW_QUERY_KEY=0 (приема ключ само в хедър x-api-key), DEEP_VISIT_EXTRA_ARGS (през запетая).
 //
 // API: GET /deep-check?url=...&clicks=6&wait=2.5&mobile=0|1&deep=1|0&rounds=1..3&play_url=...&debug=1
+//      експерименти: &locale=bg-BG &tz=Europe/Sofia &dwell=20 (секунди чакане преди първия клик) &returning=1 (рунд 2 със запазени бисквитки)
 
 const express = require('express');
 const crypto = require('crypto');
@@ -47,6 +48,8 @@ const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
 const WORKER_VERSION = 'v5';
+const DEFAULT_LOCALE = process.env.DEEP_VISIT_LOCALE || 'en-US';
+const DEFAULT_TZ = process.env.DEEP_VISIT_TZ || '';
 
 // ---------------------------------------------------------------------------------------------
 // Списъци
@@ -428,7 +431,7 @@ async function runLimited(fn) {
   try { return await fn(); } finally { release(); }
 }
 
-async function syncClientHints(p, ua, isMobile, fullVer) {
+async function syncClientHints(p, ua, isMobile, fullVer, lang) {
   try {
     const major = String(fullVer).split('.')[0];
     const brands = [
@@ -439,7 +442,7 @@ async function syncClientHints(p, ua, isMobile, fullVer) {
     const cdp = await p.context().newCDPSession(p);
     await cdp.send('Emulation.setUserAgentOverride', {
       userAgent: ua,
-      acceptLanguage: 'en-US',
+      acceptLanguage: lang || 'en-US',
       platform: isMobile ? 'Linux armv8l' : 'Win32',
       userAgentMetadata: {
         brands,
@@ -602,6 +605,9 @@ async function analyze(rawUrl, opts) {
     debug: [],
   };
   const roundsInfo = [];
+  const lang = opts.locale || DEFAULT_LOCALE;
+  const tzId = opts.tz || DEFAULT_TZ;
+  let savedState = null; // бисквити/storage от предишен рунд (returning=1)
   const maxRounds = opts.deep ? Math.min(3, Math.max(1, opts.rounds || DEFAULT_ROUNDS)) : 1;
 
   const bump = (map, key) => map.set(key, (map.get(key) || 0) + 1);
@@ -612,16 +618,19 @@ async function analyze(rawUrl, opts) {
     const popupsBefore = S.popupRecords.length;
     const total = idx === 0 ? opts.clicks : Math.min(opts.clicks, 4);
     const waitMs = opts.waitMs;
-    const context = await browser.newContext({
+    const ctxOpts = {
       userAgent: ua,
       viewport: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
-      locale: 'en-US',
+      locale: lang,
       ignoreHTTPSErrors: true,
       isMobile,
       hasTouch: isMobile,
       deviceScaleFactor: isMobile ? 3 : 1,
       acceptDownloads: false,
-    });
+    };
+    if (tzId) ctxOpts.timezoneId = tzId;
+    if (opts.returning && savedState) ctxOpts.storageState = savedState;
+    const context = await browser.newContext(ctxOpts);
     const killer = setTimeout(() => context.close().catch(() => {}), Math.max(15000, deadline - Date.now() + 5000));
     let phase = 'load';
     let page = null;
@@ -655,7 +664,7 @@ async function analyze(rawUrl, opts) {
       await context.addInitScript(hookScript, bindName);
 
       page = await context.newPage();
-      await syncClientHints(page, ua, isMobile, fullVer);
+      await syncClientHints(page, ua, isMobile, fullVer, lang);
       page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
       page.on('download', () => { S.downloads++; });
       page.on('crash', () => { info.crashed = true; });
@@ -701,7 +710,7 @@ async function analyze(rawUrl, opts) {
         };
         p.on('framenavigated', track);
         try { track(p.mainFrame()); } catch (_) {}
-        syncClientHints(p, ua, isMobile, fullVer).catch(() => {});
+        syncClientHints(p, ua, isMobile, fullVer, lang).catch(() => {});
         // оставяме го малко да се пренасочва (за веригата), после затваряме
         setTimeout(() => { p.close().catch(() => {}); }, S.popupRecords.length > 12 ? 300 : 5000);
       });
@@ -730,12 +739,18 @@ async function analyze(rawUrl, opts) {
         } catch (_) {}
       });
 
-      context.on('response', (res) => {
+      context.on('response', async (res) => {
         try {
           const ru = new URL(res.url());
           if (S.adResponses.length < 16 && adMatchHost(ru.hostname.toLowerCase())) {
             const h = res.headers();
-            S.adResponses.push({ host: ru.hostname, path: (ru.pathname + ru.search).slice(0, 60), status: res.status(), type: String(h['content-type'] || '').slice(0, 40), len: h['content-length'] || null });
+            const entry = { round: idx + 1, host: ru.hostname, path: (ru.pathname + ru.search).slice(0, 60), status: res.status(), type: String(h['content-type'] || '').slice(0, 40), len: h['content-length'] || null, bytes: null, snippet: null, set_cookie: !!h['set-cookie'] };
+            S.adResponses.push(entry);
+            try {
+              const b = await res.body();
+              entry.bytes = b.length;
+              entry.snippet = b.toString('utf8', 0, 160).replace(/\s+/g, ' ');
+            } catch (_) {}
           }
         } catch (_) {}
         try {
@@ -795,6 +810,15 @@ async function analyze(rawUrl, opts) {
           }
         } catch (_) {}
         await sleep(850);
+      }
+      // По-дълго "четене" преди първия клик (по избор): някои скриптове се активират след 10–30 сек.
+      const dwellMs = Math.min(Math.max(0, (opts.dwell || 0) * 1000), Math.max(0, deadline - Date.now() - 60000));
+      for (let t = 0; t < dwellMs; t += 2000) {
+        try {
+          if (!isMobile) await page.mouse.move(rnd(vp.width * 0.2, vp.width * 0.8), rnd(vp.height * 0.2, vp.height * 0.8), { steps: 6 });
+          else await page.evaluate(() => window.scrollBy(0, 80));
+        } catch (_) {}
+        await sleep(Math.min(2000, dwellMs - t));
       }
       phase = 'interact';
 
@@ -1168,6 +1192,7 @@ async function analyze(rawUrl, opts) {
     } finally {
       info.clicks = clicks;
       info.popups = S.popupRecords.length - popupsBefore;
+      if (opts.returning) { try { savedState = await context.storageState(); } catch (_) {} }
       clearTimeout(killer);
       await context.close().catch(() => {});
     }
@@ -1337,6 +1362,10 @@ async function analyze(rawUrl, opts) {
         mobile: isMobile,
         user_agent: ua,
         rounds_planned: maxRounds,
+        locale: lang,
+        timezone: tzId || 'server_default',
+        dwell_sec: opts.dwell || 0,
+        returning_visitor_round2: !!opts.returning,
       },
       rounds: roundsInfo,
       debug: opts.debug ? S.debug : undefined,
@@ -1377,9 +1406,13 @@ function buildApp() {
     const rounds = Math.min(3, Math.max(1, parseInt(req.query.rounds || String(DEFAULT_ROUNDS), 10) || DEFAULT_ROUNDS));
     const playUrl = req.query.play_url ? String(req.query.play_url) : '';
     const debug = req.query.debug === '1';
+    const locale = /^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})?$/.test(String(req.query.locale || '')) ? String(req.query.locale) : '';
+    const tz = /^[A-Za-z_]+(\/[A-Za-z_+-]+){0,2}$/.test(String(req.query.tz || '')) ? String(req.query.tz) : '';
+    const dwell = Math.min(40, Math.max(0, parseFloat(req.query.dwell || '0') || 0));
+    const returning = req.query.returning === '1';
     try {
       const result = await runLimited(() => analyze(String(url), {
-        clicks, waitMs: Math.round(waitSec * 1000), mobile, deep, rounds, playUrl, debug,
+        clicks, waitMs: Math.round(waitSec * 1000), mobile, deep, rounds, playUrl, debug, locale, tz, dwell, returning,
       }));
       res.json(result);
     } catch (e) {
