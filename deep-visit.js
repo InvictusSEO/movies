@@ -864,6 +864,9 @@ async function analyze(rawUrl, opts) {
               player_like: Array.from(document.querySelectorAll('[id*="player" i], [class*="player" i]')).slice(0, 8).map((e) => ({ tag: e.tagName.toLowerCase(), id: cut(e.id, 30), cls: cut(e.className, 50), ...box(e) })),
               buttons: Array.from(document.querySelectorAll('a, button, [role="button"]')).filter((e) => /play|watch|server|episode|season|стрийм|▶/i.test((e.innerText || '') + ' ' + (e.className || ''))).slice(0, 14)
                 .map((e) => ({ tag: e.tagName.toLowerCase(), text: cut(e.innerText, 30), href: cut(e.getAttribute('href'), 70), cls: cut(e.className, 40), ...box(e) })),
+              links: Array.from(document.querySelectorAll('a[href]')).filter((a) => a.hostname === location.hostname).slice(0, 400)
+                .map((a) => { const r = a.getBoundingClientRect(); const im = a.querySelector('img'); return { href: cut(a.getAttribute('href'), 60), text: cut(a.innerText, 20), img: !!im, w: Math.round(Math.max(r.width, im ? im.getBoundingClientRect().width : 0)), anc: cut(a.parentElement ? a.parentElement.className : '', 30), nav: !!a.closest('nav, header, footer') }; })
+                .filter((l) => !l.nav).slice(0, 12),
               text: cut(document.body ? document.body.innerText : '', 250),
             };
           });
@@ -968,7 +971,7 @@ async function analyze(rawUrl, opts) {
           for (let i = 0; i < as.length; i++) {
             try {
               const a = as[i];
-              if (a.closest('nav, header, footer, [class*="menu" i], [class*="navbar" i], [class*="sidebar" i]')) continue;
+              if (a.closest('nav, header, footer, [role="navigation"], [class~="menu"], [class~="navbar"], [class~="nav"], [class~="sidebar"]')) continue;
               const u = new URL(a.href);
               if (!/^https?:$/.test(u.protocol) || !roots.includes(rootOf(u.hostname))) continue;
               if (a.href === cur || bad.test(u.pathname) || u.pathname.length < 4) continue;
@@ -988,10 +991,42 @@ async function analyze(rawUrl, opts) {
               if (s > bestS) { bestS = s; best = { idx: i, sig: a.href }; }
             } catch (_) {}
           }
-          return bestS >= 3 ? best : null;
+          return bestS >= 2 ? best : null;
         }, { roots: Array.from(S.siteRoots), cur }).catch(() => null);
         if (!pick || clickedSigs.has(pick.sig)) return null;
         const h = (await page.$$('a[href]'))[pick.idx];
+        if (!h) return null;
+        clickedSigs.add(pick.sig);
+        return await clickHandle(h, true);
+      }
+
+      // Сериали: след "Watch now" често има списък с епизоди — кликваме първия
+      async function findEpisodeLink() {
+        const pick = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll('a, button, li, div, span'));
+          let best = null, bestS = 0;
+          for (let i = 0; i < els.length; i++) {
+            try {
+              const el = els[i];
+              if (el.children.length > 3) continue;
+              const t = (el.innerText || '').trim();
+              if (!t || t.length > 40) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width < 20 || r.height < 15) continue;
+              const st = getComputedStyle(el);
+              if (st.visibility === 'hidden' || st.display === 'none') continue;
+              const cls = String(el.className || '').toLowerCase();
+              let s = 0;
+              if (/^(eps?\.?|episode|ep)\s*0*1\b/i.test(t)) s = 5;
+              else if (/^(eps?\.?|episode|ep)\s*\d+/i.test(t)) s = 3;
+              else if (/eps-item|episode-item|ep-item|episode_item/.test(cls)) s = 4;
+              if (s > bestS) { bestS = s; best = { idx: i, sig: 'EP|' + t.slice(0, 30) + '|' + cls.slice(0, 40) }; }
+            } catch (_) {}
+          }
+          return bestS >= 3 ? best : null;
+        }).catch(() => null);
+        if (!pick || clickedSigs.has(pick.sig)) return null;
+        const h = (await page.$$('a, button, li, div, span'))[pick.idx];
         if (!h) return null;
         clickedSigs.add(pick.sig);
         return await clickHandle(h, true);
@@ -1070,6 +1105,7 @@ async function analyze(rawUrl, opts) {
           if (lateWaitFor !== cur) { lateWaitFor = cur; await sleep(2500); await snap('no_player_after_wait'); continue; }
           if (navClicks < 4) {
             if (await step('play_button', findPlayButton)) { navClicks++; await sleep(1500); continue; }
+            if ((S.detailReached || navClicks >= 1) && await step('episode_click', findEpisodeLink)) { navClicks++; await sleep(1500); continue; }
             if (!S.detailReached || navClicks === 0) {
               if (await step('content_link', findContentLink)) { navClicks++; await sleep(1500); continue; }
             }
