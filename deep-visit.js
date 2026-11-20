@@ -1,13 +1,30 @@
-// deep-visit.js — FSS Deep Visit Worker v5.3
+// deep-visit.js — FSS Deep Visit Worker v5.4
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
+// (по желание: patchright — виж DEEP_VISIT_ENGINE)
 
 const express = require('express');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
-const { chromium } = require('playwright-extra');
-const stealth = require('puppeteer-extra-plugin-stealth')();
-chromium.use(stealth);
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+// Двигател: по подразбиране playwright-extra + stealth. По желание (експериментално): patchright.
+let chromium = null;
+let ENGINE = 'playwright-extra';
+if (process.env.DEEP_VISIT_ENGINE === 'patchright') {
+  try {
+    chromium = require('patchright').chromium;
+    ENGINE = 'patchright';
+  } catch (e) {
+    console.warn('[deep-visit] patchright не е инсталиран, връщам playwright-extra:', String(e.message || e).split('\n')[0]);
+  }
+}
+if (!chromium) {
+  chromium = require('playwright-extra').chromium;
+  chromium.use(require('puppeteer-extra-plugin-stealth')());
+}
 
 const PORT = process.env.DEEP_VISIT_PORT || 3001;
 const API_KEY = process.env.DEEP_VISIT_KEY || '';
@@ -19,7 +36,11 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5.3';
+const WORKER_VERSION = 'v5.4';
+const QUIET_CONSOLE_DEFAULT = process.env.DEEP_VISIT_QUIET_CONSOLE !== '0';   // заглушава console.* срещу anti-devtool капани
+const BLOCK_ANTIDEBUG = process.env.DEEP_VISIT_BLOCK_ANTIDEBUG !== '0';        // блокира известни anti-devtool скриптове
+const SNAP_DIR = process.env.DEEP_VISIT_SNAPSHOT_DIR || path.join(os.tmpdir(), 'fss-snapshots');
+const SNAP_KEEP = Math.max(5, parseInt(process.env.DEEP_VISIT_SNAPSHOT_KEEP || '20', 10) || 20);
 const DEFAULT_LOCALE = process.env.DEEP_VISIT_LOCALE || 'en-US';
 const DEFAULT_TZ = process.env.DEEP_VISIT_TZ || '';
 
@@ -63,7 +84,8 @@ const AD_DOMAINS = [
   'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
   'diketime.com','bytogeticr.com','vebo-vast.com','adoto.net','proftrafficcounter.com',
   'wpadmngr.com','nawpush.com','capndr.com','ntvpforever.com','cabnnr.com','metricswpsh.com',
-  'uuidksinc.net','new-programmatic.com','liftdsp.com','whfcutler.com'
+  'uuidksinc.net','new-programmatic.com','liftdsp.com','whfcutler.com',
+  'sneerscuartel.com','deofleadyetca.org','kentinedafile.org','leforgottedydisgu.org','rm358.com'
 ];
 
 const POPUNDER_DOMAINS = [
@@ -78,7 +100,8 @@ const POPUNDER_DOMAINS = [
   'chooxaur.com','gloaphoo.net','phaurtuh.net','thaudray.com','whephoochi.com','zaubanel.com',
   'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
   'diketime.com','bytogeticr.com','wpadmngr.com','nawpush.com','capndr.com','ntvpforever.com',
-  'cabnnr.com','metricswpsh.com','uuidksinc.net','whfcutler.com'
+  'cabnnr.com','metricswpsh.com','uuidksinc.net','whfcutler.com',
+  'sneerscuartel.com','deofleadyetca.org','kentinedafile.org','leforgottedydisgu.org','rm358.com'
 ];
 
 const LEGIT_CDNS = [
@@ -112,6 +135,31 @@ const MULTI_TLDS = new Set([
   'com.ua','com.ru','com.cn','com.co','com.pe','com.ve','com.ec','com.pk','com.bd','com.my',
   'com.ph','com.vn','co.id','co.th','or.id','web.id'
 ]);
+
+// Попъндър мрежите връщат 5-байтов „пънч“ от типа "// mt" / "// pr", когато не желаят да покажат реклама
+// (най-често защото IP-то е от хостинг). Самият отговор е признак за семейството.
+const STUB_RE = /^\/\/\s*[a-z0-9]{1,6}\s*$/i;
+const POPUNDER_PATH_RE = /(^|[\/_.-])(pop-?under|click-?under|popunder)([\/_.-]|$)/i;
+// Примамки: страници за „безплатно сваляне“, афилиейт/оферта параметри и т.н.
+const LURE_RE = /(download[-_]?free|free[-_]?download|download\.php|\/download\b|\/dl\/|[?&](clickid|click_id|affid|aff_id|offer_id|offerid|subid|sub_id|zoneid|zone_id)=|giftcard|survey|you-?won|prize|virus|update[-_]?(flash|chrome|browser))/i;
+const ANTIDEBUG_URL_RE = /disable-devtool|devtools?-detect|devtools-detector|console-ban|fuck-devtools/i;
+// Признаци в скрипт, който може да изпразни страницата / да засича автоматизация
+const SCRIPT_FLAG_RES = [
+  ['devtool_detect', /disable-devtool|devtools?-?detect|devtoolsDetector|isDevToolOpen|ondevtoolopen|DevToolsOpen/i],
+  ['debugger_stmt', /\bdebugger\b\s*[;}]/],
+  ['about_blank', /about:blank/],
+  ['webdriver_check', /navigator\.webdriver|__webdriver|_phantom|callPhantom|__nightmare/],
+  ['window_close', /window\.close\s*\(|top\.close\s*\(/],
+  ['outer_size_check', /outerWidth\s*-\s*innerWidth|innerWidth\s*-\s*outerWidth|outerHeight\s*-\s*innerHeight|innerHeight\s*-\s*outerHeight/],
+];
+
+function scanScriptText(txt, host) {
+  const flags = [];
+  for (const [name, re] of SCRIPT_FLAG_RES) { if (re.test(txt)) flags.push(name); }
+  // CDN библиотеки (jQuery и др.) често съдържат about:blank / close — не са интересни сами по себе си
+  if (host && isLegitCdn(host) && flags.every((f) => f === 'about_blank' || f === 'window_close')) return [];
+  return flags;
+}
 
 const COMMON_WORDS = [
   'google','cloud','share','this','font','awesome','media','video','movie','movies','film','play',
@@ -354,6 +402,68 @@ function looksLikeDga(host) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Статистика и текстови снимки (snapshots)
+// ---------------------------------------------------------------------------------------------
+const STATS = {
+  started: Date.now(), total: 0, ok: 0, failed: 0, blanked: 0, saved_by_retry: 0, cf_blocked: 0,
+  by_verdict: {}, by_label: {}, last_errors: [],
+};
+
+function recordStats(result) {
+  try {
+    STATS.total++;
+    if (!result || !result.success) {
+      STATS.failed++;
+      STATS.last_errors.unshift({ ts: new Date().toISOString(), error: String((result && result.error) || 'unknown').slice(0, 160) });
+      STATS.last_errors.length = Math.min(STATS.last_errors.length, 10);
+      return;
+    }
+    STATS.ok++;
+    if (result.cf_challenge) STATS.cf_blocked++;
+    const d = result.diagnostics || {};
+    if (d.blanked) STATS.blanked++;
+    if (d.attempts && d.attempts.length > 1 && !d.blanked) STATS.saved_by_retry++;
+    STATS.by_verdict[result.verdict] = (STATS.by_verdict[result.verdict] || 0) + 1;
+    STATS.by_label[result.label] = (STATS.by_label[result.label] || 0) + 1;
+  } catch (_) {}
+}
+
+function newSnapshotId(url) {
+  const d = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+  let slug = '';
+  try { slug = new URL(url).hostname.replace(/^www\./, '').replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 14); } catch (_) {}
+  return d.slice(0, 8) + '-' + d.slice(8) + '-' + crypto.randomBytes(2).toString('hex') + (slug ? '-' + slug : '');
+}
+
+async function saveSnapshot(id, text) {
+  await fs.promises.mkdir(SNAP_DIR, { recursive: true });
+  await fs.promises.writeFile(path.join(SNAP_DIR, id + '.txt'), text, 'utf8');
+  try {
+    const files = (await fs.promises.readdir(SNAP_DIR)).filter((f) => f.endsWith('.txt'));
+    if (files.length > SNAP_KEEP) {
+      const stats = await Promise.all(files.map(async (f) => ({ f, t: (await fs.promises.stat(path.join(SNAP_DIR, f))).mtimeMs })));
+      stats.sort((a, b) => a.t - b.t);
+      for (const x of stats.slice(0, files.length - SNAP_KEEP)) await fs.promises.unlink(path.join(SNAP_DIR, x.f)).catch(() => {});
+    }
+  } catch (_) {}
+}
+
+async function listSnapshots() {
+  try {
+    const files = (await fs.promises.readdir(SNAP_DIR)).filter((f) => f.endsWith('.txt'));
+    const out = [];
+    for (const f of files) {
+      try {
+        const st = await fs.promises.stat(path.join(SNAP_DIR, f));
+        out.push({ id: f.replace(/\.txt$/, ''), bytes: st.size, ts: new Date(st.mtimeMs).toISOString(), mtime: st.mtimeMs });
+      } catch (_) {}
+    }
+    out.sort((a, b) => b.mtime - a.mtime);
+    return out.map(({ mtime, ...r }) => r);
+  } catch (_) { return []; }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Браузър
 // ---------------------------------------------------------------------------------------------
 let browserPromise = null;
@@ -442,42 +552,11 @@ async function syncClientHints(p, ua, isMobile, fullVer, lang) {
   } catch (_) {}
 }
 
-function hookScript(bindName) {
+function hookScript(cfg) {
+  const bindName = cfg && cfg.bind;
+  const quiet = !!(cfg && cfg.quiet);
   try {
-    // Фикс: Неутрализиране на debugger капаните на anti-devtool скриптовете
-    try {
-      const origConstructor = Function.prototype.constructor;
-      Function.prototype.constructor = function(str) {
-        if (typeof str === 'string' && str.trim() === 'debugger') return function() {};
-        return origConstructor.apply(this, arguments);
-      };
-    } catch (_) {}
-
-    // Фикс: Заобикаляне на anti-automation проверки за размер на прозореца
-    try {
-      if (!window.outerWidth || window.outerWidth === 0) {
-        Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1920 });
-      }
-      if (!window.outerHeight || window.outerHeight === 0) {
-        Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 1080) + 85 });
-      }
-    } catch (_) {}
-
-    // Блокиране на anti-bot затваряне на страницата или бягство в about:blank
-    try {
-      window.close = function() {};
-      const origReplace = window.location.replace;
-      window.location.replace = function(url) {
-        if (!url || String(url).startsWith('about:')) return;
-        return origReplace.apply(this, arguments);
-      };
-      const origAssign = window.location.assign;
-      window.location.assign = function(url) {
-        if (!url || String(url).startsWith('about:')) return;
-        return origAssign.apply(this, arguments);
-      };
-    } catch (_) {}
-
+    // Маскиране на подменените функции като „native“
     const nativeToString = Function.prototype.toString;
     const mask = new WeakMap();
     const toStringWrapper = function toString() {
@@ -485,14 +564,49 @@ function hookScript(bindName) {
       return nativeToString.call(this);
     };
     mask.set(toStringWrapper, 'function toString() { [native code] }');
-    Function.prototype.toString = toStringWrapper;
-    
+    try { Function.prototype.toString = toStringWrapper; } catch (_) {}
+
     const camouflage = (fn, orig, name) => {
       try { mask.set(fn, nativeToString.call(orig)); } catch (_) {}
       try { Object.defineProperty(fn, 'name', { value: name }); } catch (_) {}
       return fn;
     };
-    
+
+    // Тих режим на конзолата: anti-devtool капаните (console.log/debug/table с „капан“ обект) засичат
+    // автоматизацията през DevTools протокола. Без реални console.* повиквания няма какво да се засече.
+    if (quiet && typeof console === 'object') {
+      for (const n of ['log', 'info', 'debug', 'table', 'dir', 'dirxml', 'trace', 'clear', 'group', 'groupCollapsed',
+        'groupEnd', 'count', 'countReset', 'time', 'timeEnd', 'timeLog', 'assert', 'profile', 'profileEnd']) {
+        try {
+          const o = console[n];
+          if (typeof o === 'function') console[n] = camouflage(function () {}, o, n);
+        } catch (_) {}
+      }
+      for (const n of ['warn', 'error']) {
+        try {
+          const o = console[n];
+          if (typeof o !== 'function') continue;
+          console[n] = camouflage(function () {
+            try { return o.apply(console, Array.prototype.map.call(arguments, (a) => (a && typeof a === 'object') ? '[object]' : a)); } catch (_) {}
+          }, o, n);
+        } catch (_) {}
+      }
+    }
+
+    // Размери на прозореца (някои защити сравняват outer/inner)
+    try {
+      if (!window.outerWidth) Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1920 });
+      if (!window.outerHeight) Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 1080) + 85 });
+    } catch (_) {}
+
+    // Страницата не трябва да може да затвори себе си (anti-bot). Фалшиво „затваряне“ не променя нищо за анализа.
+    try {
+      const oc = window.close;
+      if (typeof oc === 'function') window.close = camouflage(function () {}, oc, 'close');
+    } catch (_) {}
+
+    if (!bindName) return;
+
     let cached = null;
     const report = (type, targetUrl) => {
       try {
@@ -504,7 +618,7 @@ function hookScript(bindName) {
         }
       } catch (_) {}
     };
-    
+
     const origOpen = window.open;
     if (origOpen) {
       window.open = camouflage(function (u) {
@@ -512,7 +626,7 @@ function hookScript(bindName) {
         return origOpen.apply(this, arguments);
       }, origOpen, 'open');
     }
-    
+
     const origClick = HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click = camouflage(function () {
       try {
@@ -522,7 +636,7 @@ function hookScript(bindName) {
       } catch (_) {}
       return origClick.apply(this, arguments);
     }, origClick, 'click');
-    
+
     const origSubmit = HTMLFormElement.prototype.submit;
     HTMLFormElement.prototype.submit = camouflage(function () {
       try {
@@ -532,7 +646,7 @@ function hookScript(bindName) {
       } catch (_) {}
       return origSubmit.apply(this, arguments);
     }, origSubmit, 'submit');
-    
+
     document.addEventListener('submit', (e) => {
       try {
         const f = e.target;
@@ -541,7 +655,7 @@ function hookScript(bindName) {
         }
       } catch (_) {}
     }, true);
-    
+
     document.addEventListener('click', (e) => {
       try {
         const a = e.target && e.target.closest ? e.target.closest('a[target="_blank"]') : null;
@@ -549,6 +663,100 @@ function hookScript(bindName) {
       } catch (_) {}
     }, true);
   } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Статичен анализ на HTML (резервен вариант, когато браузърът е блокиран или не стига до плеера)
+// ---------------------------------------------------------------------------------------------
+async function fetchHtmlSafe(rawUrl, ua, lang) {
+  let cur = rawUrl;
+  for (let hop = 0; hop < 4; hop++) {
+    const u = await assertSafeUrl(cur);
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), 10000);
+    try {
+      const r = await fetch(u.href, {
+        signal: c.signal, redirect: 'manual',
+        headers: { 'user-agent': ua, 'accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8', 'accept-language': lang || 'en-US' },
+      });
+      if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { cur = new URL(r.headers.get('location'), u.href).href; continue; }
+      const buf = Buffer.from(await r.arrayBuffer());
+      return { url: u.href, status: r.status, bytes: buf.length, html: buf.toString('utf8', 0, 1500000) };
+    } finally { clearTimeout(t); }
+  }
+  throw new Error('too many redirects');
+}
+
+function staticScanHtml(html, baseUrl, siteRoots) {
+  const out = {
+    title: '', bytes: html.length, scripts_total: 0, inline_scripts: 0, third_party_script_hosts: [],
+    ad_hosts: [], popunder_hosts: [], iframes: [], media_urls: [], watch_links: [], inline_flags: [], meta_refresh: false,
+  };
+  const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (t) out.title = t[1].replace(/\s+/g, ' ').trim().slice(0, 120);
+  out.meta_refresh = /<meta[^>]+http-equiv=["']?refresh/i.test(html);
+  const base = (() => { try { return new URL(baseUrl); } catch { return null; } })();
+  const abs = (x) => { try { return new URL(x, base || undefined).href; } catch { return null; } };
+  const roots = siteRoots instanceof Set ? siteRoots : new Set();
+  if (base) roots.add(getRootDomain(base.hostname));
+
+  const tp = new Set(), ads = new Set(), pops = new Set();
+  const reScript = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = reScript.exec(html))) {
+    out.scripts_total++;
+    const src = (m[1].match(/\bsrc=["']([^"']+)["']/i) || [])[1];
+    if (src) {
+      const a = abs(src);
+      if (!a) continue;
+      let h = '';
+      try { h = new URL(a).hostname.toLowerCase(); } catch (_) { continue; }
+      if (!roots.has(getRootDomain(h))) tp.add(h);
+      const ad = adMatchHost(h);
+      if (ad) ads.add(ad);
+      const pu = popunderMatchHost(h);
+      if (pu) pops.add(pu);
+    } else if (m[2] && m[2].trim()) {
+      out.inline_scripts++;
+      const fl = scanScriptText(m[2], '');
+      for (const f of fl) if (!out.inline_flags.includes(f)) out.inline_flags.push(f);
+    }
+  }
+  out.third_party_script_hosts = Array.from(tp).slice(0, 25);
+  out.ad_hosts = Array.from(ads).slice(0, 15);
+  out.popunder_hosts = Array.from(pops).slice(0, 10);
+
+  const seenI = new Set();
+  const reIf = /<iframe\b[^>]*?\b(?:data-)?src=["']([^"']+)["']/gi;
+  while ((m = reIf.exec(html)) && out.iframes.length < 8) {
+    const a = abs(m[1]);
+    if (!a || seenI.has(a) || !/^https?:/i.test(a)) continue;
+    seenI.add(a);
+    out.iframes.push(a.slice(0, 160));
+  }
+  const unesc = html.replace(/\\\//g, '/');
+  const seenM = new Set();
+  const reMedia = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mpd|mp4)(?:\?[^\s"'<>\\]*)?/gi;
+  while ((m = reMedia.exec(unesc)) && out.media_urls.length < 8) {
+    if (seenM.has(m[0])) continue;
+    seenM.add(m[0]);
+    out.media_urls.push(m[0].slice(0, 160));
+  }
+  const seenW = new Set();
+  const reA = /<a\b[^>]*?\bhref=["']([^"'#]+)["']/gi;
+  while ((m = reA.exec(html)) && out.watch_links.length < 8) {
+    const a = abs(m[1]);
+    if (!a || !/^https?:/i.test(a)) continue;
+    let u;
+    try { u = new URL(a); } catch (_) { continue; }
+    if (!roots.has(getRootDomain(u.hostname))) continue;
+    if (!/\/(watch|play|episode|stream|embed|movie|series|tv)[-/]/i.test(u.pathname)) continue;
+    if (seenW.has(u.pathname)) continue;
+    seenW.add(u.pathname);
+    out.watch_links.push(a.slice(0, 160));
+  }
+  out.player_hint = out.iframes.some((x) => !adDomainMatch(x)) || out.media_urls.length > 0;
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -604,7 +812,10 @@ async function analyze(rawUrl, opts) {
     siteRoots: new Set([startRoot]), detailReached: false, playerFound: false, playerClicked: false,
     playerUrl: null, title: '', cfChallenge: false, navError: null, loaded: false, techStack: 'unknown',
     hasVideo: false, hasIframe: false, hasM3u8: false, overlays: 0, debug: [],
+    nav: [], pageErrors: [], consoleMsgs: [], docs: [], scriptScan: [], antiBlocked: [],
+    stubHosts: new Map(), attempts: [], blanked: false, blank: null,
   };
+  const quiet = opts.quiet == null ? QUIET_CONSOLE_DEFAULT : !!opts.quiet;
   
   const roundsInfo = [];
   const lang = opts.locale || DEFAULT_LOCALE;
@@ -614,8 +825,10 @@ async function analyze(rawUrl, opts) {
   const bump = (map, key) => map.set(key, (map.get(key) || 0) + 1);
   const rawBad = () => S.popupRecords.length + S.hijackUrls.length + S.downloads;
 
-  async function runRound(idx, target, direct) {
-    const info = { round: idx + 1, target: target.slice(0, 200), direct, clicks: 0, player_found: false, player_clicks: 0, popups: 0, blocked: false };
+  async function runRound(idx, target, direct, profile = 'standard') {
+    const bare = profile === 'bare';   // „bare“: без нашите куки в страницата (hooks, тиха конзола, блокиране на anti-debug)
+    const roundStart = Date.now();
+    const info = { round: idx + 1, profile, target: target.slice(0, 200), direct, clicks: 0, player_found: false, player_clicks: 0, popups: 0, blocked: false };
     const popupsBefore = S.popupRecords.length;
     const total = idx === 0 ? opts.clicks : Math.min(opts.clicks, 4);
     const waitMs = opts.waitMs;
@@ -633,60 +846,69 @@ async function analyze(rawUrl, opts) {
     let phase = 'load';
     let page = null;
     let lastMainUrl = target;
+    let lastSiteUrl = target;
+    let midBlank = false;
+    let closing = false;   // ние затваряме страницата (не сайтът)
     let clicks = 0;
     const clickedSigs = new Set();
 
     try {
+      // Защита (SSRF) + блокиране на известни anti-devtool скриптове.
+      // При ГРЕШКА в проверката заявката се БЛОКИРА (във v5.3 минаваше).
       await context.route('**/*', async (route) => {
+        let ok = false;
         try {
           const req = route.request();
-          
-          // Фикс v5.3: Спиране на бягството в about:blank на ниво Navigation Request
-          if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-            const navUrl = req.url();
-            if (navUrl.startsWith('about:')) {
-              return route.abort('blockedbyclient');
-            }
-          }
-
           const u = new URL(req.url());
-          
-          // Фикс: Блокиране на anti-devtool / anti-automation скриптове
-          if (/disable-devtool|devtools-detect|console-ban|fuck-devtools/i.test(u.href)) {
-            return route.abort('blockedbyclient');
+          if (!bare && BLOCK_ANTIDEBUG && ANTIDEBUG_URL_RE.test(u.href)) {
+            if (S.antiBlocked.length < 8) S.antiBlocked.push(u.href.slice(0, 160));
+            ok = false;
+          } else if (u.protocol === 'http:' || u.protocol === 'https:') {
+            ok = await hostAllowed(u.hostname);
+          } else {
+            ok = /^(data|blob|about|ws|wss):$/.test(u.protocol);
           }
-          if (u.protocol === 'http:' || u.protocol === 'https:') {
-            if (!(await hostAllowed(u.hostname))) return route.abort('blockedbyclient');
-          } else if (!/^(data|blob|about|ws|wss):$/.test(u.protocol)) {
-            return route.abort('blockedbyclient');
-          }
-        } catch (_) {}
+        } catch (_) { ok = false; }
+        if (!ok) return route.abort('blockedbyclient').catch(() => {});
         return route.continue().catch(() => {});
       });
 
-      const bindName = '_f' + crypto.randomBytes(6).toString('hex');
-      await context.exposeBinding(bindName, (_src, type, u, pageUrl) => {
-        try {
-          if (S.interceptedOpens.length < 200) {
-            S.interceptedOpens.push({ type: String(type), url: String(u).slice(0, 300), page: String(pageUrl).slice(0, 160), ts: Date.now(), round: idx + 1 });
-          }
-        } catch (_) {}
-      });
-      await context.addInitScript(hookScript, bindName);
+      if (!bare) {
+        const bindName = '_f' + crypto.randomBytes(6).toString('hex');
+        await context.exposeBinding(bindName, (_src, type, u, pageUrl) => {
+          try {
+            if (S.interceptedOpens.length < 200) {
+              S.interceptedOpens.push({ type: String(type), url: String(u).slice(0, 300), page: String(pageUrl).slice(0, 160), ts: Date.now(), round: idx + 1 });
+            }
+          } catch (_) {}
+        });
+        await context.addInitScript(hookScript, { bind: bindName, quiet });
+      }
 
       page = await context.newPage();
       await syncClientHints(page, ua, isMobile, fullVer, lang);
+      // Диагностика: времева линия на навигациите, грешки на страницата, затваряне
+      page.on('close', () => { if (!closing && S.nav.length < 80) S.nav.push({ round: idx + 1, profile, t: Date.now() - roundStart, event: 'page_closed' }); });
+      page.on('pageerror', (e) => { if (S.pageErrors.length < 12) S.pageErrors.push({ round: idx + 1, profile, t: Date.now() - roundStart, msg: String((e && e.message) || e).slice(0, 160) }); });
+      page.on('console', (m) => {
+        try {
+          const ty = m.type();
+          if ((ty === 'error' || ty === 'warning') && S.consoleMsgs.length < 12) S.consoleMsgs.push({ round: idx + 1, profile, t: Date.now() - roundStart, type: ty, msg: m.text().slice(0, 160) });
+        } catch (_) {}
+      });
       page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
       page.on('download', () => { S.downloads++; });
       page.on('crash', () => { info.crashed = true; });
       page.on('framenavigated', (fr) => {
         if (fr !== page.mainFrame()) return;
         const u = fr.url();
+        if (S.nav.length < 80) S.nav.push({ round: idx + 1, profile, t: Date.now() - roundStart, url: String(u).slice(0, 200) });
         if (!u || u === 'about:blank' || u === lastMainUrl) return;
         const prev = lastMainUrl;
         lastMainUrl = u;
         let h;
         try { h = new URL(u).hostname.toLowerCase(); } catch { return; }
+        if (h && S.siteRoots.has(getRootDomain(h))) lastSiteUrl = u;
         if (!h || S.siteRoots.has(getRootDomain(h)) || isSocialUrl(u)) return;
         const ad = adDomainMatch(u);
         if (ad) bump(S.adNavHosts, ad);
@@ -738,6 +960,7 @@ async function analyze(rawUrl, opts) {
             const tr = trackerMatchHost(host);
             if (tr) bump(S.trackerHosts, tr);
           }
+          if (!S.siteRoots.has(getRootDomain(host)) && POPUNDER_PATH_RE.test(u.pathname)) bump(S.popunderHosts, getRootDomain(host));
           const rType = req.resourceType();
           if (!S.siteRoots.has(getRootDomain(host)) && !isSocialUrl(req.url()) &&
             (rType === 'script' || rType === 'document' || rType === 'subdocument')) {
@@ -747,7 +970,55 @@ async function analyze(rawUrl, opts) {
         } catch (_) {}
       });
 
+      // Основен документ (суров HTML) и скриптове: пазим суровия HTML за диагностика и търсим скриптове,
+      // които могат да изпразнят страницата / да засичат автоматизация, както и „пънч“ скриптове на попъндър мрежи.
+      const onDocOrScript = async (res) => {
+        const rq = res.request();
+        const rt = rq.resourceType();
+        if (rt !== 'document' && rt !== 'script') return;
+        let fr = null;
+        try { fr = rq.frame(); } catch (_) {}
+        if (!fr) return;
+        let pg = null;
+        try { pg = fr.page(); } catch (_) {}
+        if (!pg || pg !== page) return;
+        const ru = new URL(res.url());
+        const host = ru.hostname.toLowerCase();
+        if (rt === 'document') {
+          if (fr !== page.mainFrame()) return;
+          if (S.docs.filter((d) => d.round === idx + 1 && d.profile === profile).length >= 4) return;
+          const st = res.status();
+          let html = '', bytes = null;
+          if (st < 300 || st >= 400) {
+            try { const b = await res.body(); bytes = b.length; html = b.toString('utf8', 0, 150000); } catch (_) {}
+          }
+          S.docs.push({ round: idx + 1, profile, url: res.url().slice(0, 200), status: st, bytes, ct: String(res.headers()['content-type'] || '').slice(0, 40), html });
+          return;
+        }
+        if (S.scriptScan.length >= 60) return;
+        let b;
+        try { b = await res.body(); } catch (_) { return; }
+        const txt = b.toString('utf8', 0, 250000);
+        const sameSite = S.siteRoots.has(getRootDomain(host));
+        const stub = !sameSite && b.length <= 20 && STUB_RE.test(txt.trim());
+        if (stub) {
+          bump(S.stubHosts, getRootDomain(host));
+          if (!adMatchHost(host)) bump(S.popunderHosts, getRootDomain(host));
+        }
+        const flags = scanScriptText(txt, host);
+        if (flags.length || stub) {
+          let snippet = null;
+          if (flags.length) {
+            const re = SCRIPT_FLAG_RES.find((x) => x[0] === flags[0])[1];
+            const mm = re.exec(txt);
+            if (mm) snippet = txt.slice(Math.max(0, mm.index - 60), mm.index + 100).replace(/\s+/g, ' ');
+          }
+          S.scriptScan.push({ round: idx + 1, profile, host, path: (ru.pathname + ru.search).slice(0, 80), bytes: b.length, third_party: !sameSite, flags, stub, snippet });
+        }
+      };
+
       context.on('response', async (res) => {
+        try { await onDocOrScript(res); } catch (_) {}
         try {
           const ru = new URL(res.url());
           const host = ru.hostname.toLowerCase();
@@ -760,9 +1031,11 @@ async function analyze(rawUrl, opts) {
               entry.bytes = b.length;
               entry.snippet = b.toString('utf8', 0, 160).replace(/\s+/g, ' ');
               
-              // Фикс: Засичане на Monetag popunder отговор "// mt"
-              if (b.length <= 20 && /^\/\/\s*mt\b/i.test(b.toString('utf8').trim())) {
+              // Попъндър семейство: 5-байтов „пънч“ ("// mt", "// pr" ...) вместо реален скрипт
+              if (b.length <= 20 && STUB_RE.test(b.toString('utf8').trim())) {
                 bump(S.popunderHosts, getRootDomain(host));
+                bump(S.stubHosts, getRootDomain(host));
+                entry.stub = true;
               }
             } catch (_) {}
           }
@@ -808,6 +1081,33 @@ async function analyze(rawUrl, opts) {
       if (idx === 0) S.title = title;
       try { S.siteRoots.add(getRootDomain(new URL(page.url()).hostname)); } catch (_) {}
       lastMainUrl = page.url();
+      lastSiteUrl = lastMainUrl && lastMainUrl !== 'about:blank' ? lastMainUrl : target;
+
+      // Страницата „изпразнена“ от самия сайт (about:blank / затворена / празен DOM)?
+      const blankCheck = async () => {
+        let url = '';
+        try { url = page.url(); } catch (_) {}
+        if (page.isClosed()) return { kind: 'page_closed' };
+        if (url === 'about:blank' || url === '') return { kind: 'about_blank' };
+        try {
+          const rawBytes = Math.max(0, ...S.docs.filter((d) => d.round === idx + 1 && d.profile === profile).map((d) => d.bytes || 0));
+          const d = await page.evaluate(() => ({ els: document.getElementsByTagName('*').length, text: (document.body ? document.body.innerText : '').trim().length }));
+          if (rawBytes >= 5000 && d.els <= 8 && d.text === 0) return { kind: 'empty_dom' };
+        } catch (_) {}
+        return null;
+      };
+      const finishBlank = (bk) => {
+        info.blanked = true;
+        info.blank_kind = bk.kind;
+        const bn = S.nav.find((n) => n.round === idx + 1 && n.profile === profile && n.url === 'about:blank');
+        info.blank_at_ms = bn ? bn.t : (Date.now() - roundStart);
+        info.last_site_url = String(lastSiteUrl).slice(0, 200);
+        return info;
+      };
+      {
+        const bk0 = await blankCheck();
+        if (bk0) return finishBlank(bk0);
+      }
 
       const vp = page.viewportSize() || { width: 1280, height: 720 };
       for (let i = 0; i < 4; i++) {
@@ -821,6 +1121,10 @@ async function analyze(rawUrl, opts) {
         } catch (_) {}
         await sleep(850);
       }
+      {
+        const bk1 = await blankCheck();
+        if (bk1) return finishBlank(bk1);
+      }
 
       const dwellMs = Math.min(Math.max(0, (opts.dwell || 0) * 1000), Math.max(0, deadline - Date.now() - 60000));
       for (let t = 0; t < dwellMs; t += 2000) {
@@ -829,6 +1133,10 @@ async function analyze(rawUrl, opts) {
           else await page.evaluate(() => window.scrollBy(0, 80));
         } catch (_) {}
         await sleep(Math.min(2000, dwellMs - t));
+      }
+      {
+        const bk2 = await blankCheck();
+        if (bk2) return finishBlank(bk2);
       }
       phase = 'interact';
 
@@ -890,6 +1198,7 @@ async function analyze(rawUrl, opts) {
 
       async function step(type, fn) {
         if (clicks >= total || Date.now() > deadline - 3000) return false;
+        try { if (page.isClosed() || page.url() === 'about:blank') { midBlank = true; return false; } } catch (_) {}
         const before = rawBad();
         let pt = null;
         try { pt = await fn(); } catch (_) {}
@@ -1089,6 +1398,38 @@ async function analyze(rawUrl, opts) {
         return await clickHandle(h, true);
       }
 
+      async function findServerTab() {
+        const pick = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll('a, button, li, div, span'));
+          let best = null, bestS = 0;
+          for (let i = 0; i < els.length; i++) {
+            try {
+              const el = els[i];
+              if (el.children.length > 3) continue;
+              const t = (el.innerText || '').trim();
+              if (!t || t.length > 24) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width < 24 || r.height < 16) continue;
+              const st = getComputedStyle(el);
+              if (st.visibility === 'hidden' || st.display === 'none') continue;
+              const cls = String(el.className || '').toLowerCase();
+              if (/\bactive\b|\bcurrent\b|\bselected\b/.test(cls)) continue;
+              let s = 0;
+              if (/^(server|source|mirror|player|embed)\s*[#:]?\s*\d*$/i.test(t)) s = 4;
+              else if (/^(vidcloud|upcloud|megacloud|streamtape|doodstream|voe|filemoon|mixdrop|vidplay|vidsrc|embedsu)\b/i.test(t)) s = 3;
+              else if (/server[-_]?(item|btn|tab|link)|(^|\s)sv-|source[-_]?item|link-item/.test(cls)) s = 3;
+              if (s > 0 && s >= bestS) { bestS = s; best = { idx: i, sig: 'SV|' + t.slice(0, 20) + '|' + cls.slice(0, 40) }; }   // при равен резултат — най-вътрешният елемент
+            } catch (_) {}
+          }
+          return bestS >= 3 ? best : null;
+        }).catch(() => null);
+        if (!pick || clickedSigs.has(pick.sig)) return null;
+        const h = (await page.$$('a, button, li, div, span'))[pick.idx];
+        if (!h) return null;
+        clickedSigs.add(pick.sig);
+        return await clickHandle(h, true);
+      }
+
       async function findEpisodeLink() {
         const pick = await page.evaluate(() => {
           const els = Array.from(document.querySelectorAll('a, button, li, div, span'));
@@ -1175,14 +1516,22 @@ async function analyze(rawUrl, opts) {
       if (!direct) await step('center_probe', centerProbe);
       if (!opts.deep) {
         let guard = 0;
-        while (clicks < total && guard++ < 20 && Date.now() < deadline - 3000) {
+        while (clicks < total && guard++ < 20 && Date.now() < deadline - 3000 && !midBlank) {
           await step('filtered_element', filteredPick);
         }
       } else {
-        let navClicks = 0, playerClicks = 0, filler = 0, lateWaitFor = '', scrolledFor = '';
-        for (let guard = 0; guard < 30 && clicks < total && Date.now() < deadline - 3000; guard++) {
+        let navClicks = 0, playerClicks = 0, filler = 0, lateWaitFor = '', scrolledFor = '', contentClicks = 0, returned = 0;
+        for (let guard = 0; guard < 30 && clicks < total && Date.now() < deadline - 3000 && !midBlank; guard++) {
           await settle();
-          const cur = page.url();
+          if (page.isClosed() || page.url() === 'about:blank') { midBlank = true; break; }
+          let cur = page.url();
+          // Ако рекламата ни е изкарала от сайта — връщаме се на последната страница на сайта
+          if (returned < 3 && lastSiteUrl && !S.siteRoots.has(rootOfUrl(cur))) {
+            returned++;
+            await page.goto(lastSiteUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            await sleep(1200);
+            cur = page.url();
+          }
           const cand = await findPlayerCandidate();
           if (cand) {
             if (playerClicks >= 3) break;
@@ -1190,12 +1539,20 @@ async function analyze(rawUrl, opts) {
             if (ok) { playerClicks++; info.player_clicks = playerClicks; continue; }
             break;
           }
-          if (lateWaitFor !== cur) { lateWaitFor = cur; await sleep(2500); await snap('no_player_after_wait'); continue; }
+          if (lateWaitFor !== cur) {
+            lateWaitFor = cur;
+            // SPA сайтовете (React/Next) рисуват плеера по-късно — изчакваме до няколко пъти
+            const polls = S.techStack === 'spa_react_next' ? 5 : 1;
+            for (let k = 0; k < polls; k++) { await sleep(k === 0 ? 2500 : 2000); if (await findPlayerCandidate()) break; }
+            await snap('no_player_after_wait');
+            continue;
+          }
           if (navClicks < 4) {
             if (await step('play_button', findPlayButton)) { navClicks++; await sleep(1500); continue; }
             if ((S.detailReached || navClicks >= 1) && await step('episode_click', findEpisodeLink)) { navClicks++; await sleep(1500); continue; }
-            if (!S.detailReached || navClicks === 0) {
-              if (await step('content_link', findContentLink)) { navClicks++; await sleep(1500); continue; }
+            if (navClicks >= 1 && await step('server_tab', findServerTab)) { navClicks++; await sleep(1500); continue; }
+            if ((!S.detailReached || navClicks === 0) && contentClicks < 2) {
+              if (await step('content_link', findContentLink)) { navClicks++; contentClicks++; await sleep(1500); continue; }
             }
           }
           if (scrolledFor !== cur) {
@@ -1208,6 +1565,7 @@ async function analyze(rawUrl, opts) {
           break;
         }
       }
+      if (midBlank) return finishBlank({ kind: page.isClosed() ? 'page_closed' : 'about_blank' });
       await snap('round_end');
       try { S.overlays = Math.max(S.overlays, Math.min(3, await page.evaluate(countOverlays))); } catch (_) {}
       await sleep(4000);
@@ -1223,6 +1581,7 @@ async function analyze(rawUrl, opts) {
       info.clicks = clicks;
       info.popups = S.popupRecords.length - popupsBefore;
       if (opts.returning) { try { savedState = await context.storageState(); } catch (_) {} }
+      closing = true;
       clearTimeout(killer);
       await context.close().catch(() => {});
     }
@@ -1235,15 +1594,46 @@ async function analyze(rawUrl, opts) {
         try { await assertSafeUrl(S.playerUrl); } catch { break; }
       }
       const target = r === 0 ? (playUrl || url) : S.playerUrl;
-      let info;
-      try {
-        info = await runRound(r, target, r > 0 || !!playUrl);
-      } catch (e) {
-        info = { round: r + 1, target: target.slice(0, 200), error: String(e.message || e).split('\n')[0] };
-        if (r === 0 && !S.loaded) throw e;
+      // Рунд 1: първо „standard“ профил; ако сайтът изпразни страницата — втори опит „bare“ (без нашите куки в страницата)
+      const profiles = r === 0 ? ['standard', 'bare'] : ['standard'];
+      let info = null;
+      for (let pi = 0; pi < profiles.length; pi++) {
+        const prof = profiles[pi];
+        if (pi > 0 && deadline - Date.now() < 50000) break;
+        try {
+          info = await runRound(r, target, r > 0 || !!playUrl, prof);
+        } catch (e) {
+          info = { round: r + 1, profile: prof, target: target.slice(0, 200), error: String(e.message || e).split('\n')[0] };
+          if (r === 0 && !S.loaded) {
+            if (pi === profiles.length - 1) throw e;
+            S.attempts.push({ round: r + 1, profile: prof, error: info.error });
+            continue;
+          }
+        }
+        S.attempts.push({ round: r + 1, profile: prof, blanked: !!info.blanked, blank_kind: info.blank_kind || null, blank_at_ms: info.blank_at_ms || null, clicks: info.clicks || 0, player_found: !!info.player_found });
+        roundsInfo.push(info);
+        const retry = r === 0 && info.blanked && prof === 'standard' && !S.playerClicked && pi < profiles.length - 1;
+        if (!retry) break;
       }
-      roundsInfo.push(info);
-      if (info.blocked) break;
+      if (info && r === 0 && info.blanked) {
+        S.blanked = true;
+        S.blank = { kind: info.blank_kind, at_ms: info.blank_at_ms, profile: info.profile, last_site_url: info.last_site_url || null };
+      }
+      if (info && info.blocked) break;
+    }
+
+    // Статичен анализ на суровия HTML (резервен вариант): когато страницата е изпразнена или плеерът не е намерен
+    let staticScan = null;
+    if (opts.static !== false && (S.blanked || !S.playerFound)) {
+      try {
+        const doc = S.docs.find((d) => d.html && d.html.length > 200);
+        let html = doc ? doc.html : '', src = 'browser_doc', baseUrl = doc ? doc.url : url, status = doc ? doc.status : null;
+        if (!html) {
+          const f = await fetchHtmlSafe(url, ua, lang);
+          html = f.html; src = 'fetch'; baseUrl = f.url; status = f.status;
+        }
+        if (html) { staticScan = staticScanHtml(html, baseUrl, new Set(S.siteRoots)); staticScan.source = src; staticScan.status = status; }
+      } catch (e) { staticScan = { error: String(e.message || e).split('\n')[0].slice(0, 120) }; }
     }
 
     const seenInt = new Set();
@@ -1290,34 +1680,61 @@ async function analyze(rawUrl, opts) {
     const adRedirects = dedupRed.filter((x) => x.src === 'page' && (adDomainMatch(x.to) || adDomainMatch(x.from)));
     const uniqueRedirects = new Set(adRedirects.map((x) => x.to)).size;
 
-    const popunderCount = Math.min(2, S.popunderHosts.size);
-    const adHostCount = Math.min(15, Math.max(0, S.adHosts.size - S.popunderHosts.size));
+    const stubHosts = Array.from(S.stubHosts.keys());
+    const popSet = new Set([...S.popunderHosts.keys(), ...((staticScan && staticScan.popunder_hosts) || [])]);
+    const adSet2 = new Set([...S.adHosts.keys(), ...((staticScan && staticScan.ad_hosts) || [])]);
+    const popunderCount = Math.min(2, popSet.size);
+    const adHostCount = Math.min(15, Array.from(adSet2).filter((h) => !popSet.has(h)).length);
     const trackerCount = Math.min(8, S.trackerHosts.size);
     const extraJs = Math.max(0, uniqueJsOpens - popups);
+
+    // Примамки: страници за „безплатно сваляне“, афилиейт/оферта линкове в рекламните вериги
+    const lureCandidates = [...popupUrls, ...dedupRed.map((x) => x.to), ...S.hijackUrls];
+    const lureUrls = Array.from(new Set(lureCandidates.filter((u) => u && !S.siteRoots.has(rootOfUrl(u)) && LURE_RE.test(u)))).slice(0, 6);
+
+    // Голям прозрачен слой сам по себе не е реклама — брои се само ако има и други признаци за реклами
+    const hasAdEvidence = adSet2.size > 0 || popSet.size > 0 || popups > 0 || uniqueRedirects > 0 || S.hijackUrls.length > 0;
+    const overlayPoints = hasAdEvidence ? S.overlays * 2 : 0;
 
     const breakdown = {
       hijacks: S.hijackUrls.length * 10,
       popups: popups * 5,
       js_opens_beyond_popups: extraJs * 4,
       ad_redirects: uniqueRedirects * 3,
-      overlays: S.overlays * 2,
+      overlays: overlayPoints,
       popunder_network_hosts: popunderCount * 8,
       unique_ad_hosts: adHostCount,
       unique_tracker_hosts: Math.floor(trackerCount * 0.5),
       downloads: S.downloads * 5,
+      lure_pages: Math.min(3, lureUrls.length) * 3,
     };
     const score = Object.values(breakdown).reduce((a, b) => a + b, 0);
     let level = 'none';
     if (score >= 30) level = 'high';
     else if (score >= 10) level = 'medium';
     else if (score >= 1) level = 'low';
-    if (S.popunderHosts.size > 0 && (level === 'none' || level === 'low')) level = 'medium';
+    if (popSet.size > 0 && (level === 'none' || level === 'low')) level = 'medium';
+
+    const observed = popups > 0 || S.hijackUrls.length > 0 || uniqueRedirects > 0 || S.downloads > 0 || extraJs > 0;
+    const scoreBasis = observed ? 'observed_behaviour' : ((popSet.size > 0 || adSet2.size > 0) ? 'ad_scripts_only' : 'none');
+    const riskFlags = [];
+    if (popSet.size > 0) riskFlags.push('popunder_network');
+    if (stubHosts.length > 0) riskFlags.push('popunder_stub_response');
+    if (popups > 0) riskFlags.push('popups');
+    if (S.hijackUrls.length > 0) riskFlags.push('page_hijack');
+    if (S.downloads > 0) riskFlags.push('forced_download');
+    if (lureUrls.length > 0) riskFlags.push('download_or_offer_lure');
+    if (uniqueRedirects > 0) riskFlags.push('ad_redirects');
 
     const notes = [];
     if (S.cfChallenge) notes.push('cf_blocked');
     if (!S.loaded && !S.cfChallenge) notes.push('page_not_loaded');
+    if (S.blanked) notes.push('page_blanked_by_site' + (S.blank && S.blank.kind ? ':' + S.blank.kind : ''));
+    if (!S.blanked && S.attempts.length > 1 && S.attempts[0].blanked) notes.push('first_profile_blanked_retry_profile_worked');
     if (S.loaded && !S.playerClicked) notes.push('player_not_reached');
-    const silentAds = S.playerClicked && popups === 0 && S.hijackUrls.length === 0 && S.adHosts.size > 0;
+    if (S.overlays > 0 && !hasAdEvidence) notes.push('overlay_ignored_no_ads_detected');
+    if (staticScan && staticScan.player_hint && !S.playerFound) notes.push('static_scan_sees_player_hint');
+    const silentAds = S.playerClicked && popups === 0 && S.hijackUrls.length === 0 && adSet2.size > 0;
     if (silentAds) notes.push('ad_scripts_loaded_but_no_activity_environment_may_suppress_them');
 
     let confidence = 'high';
@@ -1329,9 +1746,63 @@ async function analyze(rawUrl, opts) {
     let verdict;
     if (confidence === 'none') verdict = 'blocked_or_failed';
     else if (popups > 0 || S.hijackUrls.length > 0 || score >= 10) verdict = 'ads_detected';
-    else if (S.adHosts.size >= 1 && !(S.playerClicked === false && S.popunderHosts.size === 0)) verdict = 'ads_scripts_present';
+    else if (adSet2.size >= 1 && !(S.playerClicked === false && popSet.size === 0)) verdict = 'ads_scripts_present';
     else if (inconclusive) verdict = 'inconclusive';
     else verdict = 'clean_or_light';
+
+    // Прост етикет за показване на сайта
+    let label = { none: 'Clean', low: 'Light', medium: 'Moderate', high: 'Aggressive' }[level];
+    if (confidence === 'none' || (inconclusive && (level === 'none' || level === 'low'))) label = 'Unknown';
+
+    // Диагностика: защо страницата е станала празна (най-вероятна причина по наличните данни)
+    const sus = S.scriptScan.filter((x) => x.flags.length);
+    let likelyCause = null;
+    if (S.blanked) {
+      const all = new Set(sus.flatMap((x) => x.flags).concat((staticScan && staticScan.inline_flags) || []));
+      if (all.has('devtool_detect')) likelyCause = 'anti_devtool_script_present';
+      else if (all.has('webdriver_check') || all.has('outer_size_check') || all.has('window_close')) likelyCause = 'automation_check_script_present';
+      else if (S.antiBlocked.length) likelyCause = 'anti_devtool_script_was_blocked_but_page_still_blanked';
+      else likelyCause = 'unknown_site_side_blanking_(automation_detection_or_server_ip_check)';
+    } else if (S.attempts.length > 1 && S.attempts[0].blanked) {
+      likelyCause = 'our_page_hooks_or_console_changes_were_detected_by_site';
+    }
+    const diagnostics = {
+      blanked: S.blanked, blank_kind: S.blank ? S.blank.kind : null, blank_at_ms: S.blank ? S.blank.at_ms : null,
+      last_site_url: S.blank ? S.blank.last_site_url : null, likely_cause: likelyCause,
+      attempts: S.attempts, anti_debug_scripts_blocked: S.antiBlocked,
+      suspicious_scripts: sus.slice(0, 12), stub_hosts: stubHosts,
+      nav_timeline: S.nav.slice(0, 25), page_errors: S.pageErrors.slice(0, 8), console_messages: S.consoleMsgs.slice(0, 8),
+      main_documents: S.docs.map((d) => ({ round: d.round, profile: d.profile, url: d.url, status: d.status, bytes: d.bytes, content_type: d.ct })),
+      html_head: opts.debug && S.docs[0] && S.docs[0].html ? S.docs[0].html.slice(0, 4000) : undefined,
+    };
+
+    // Текстова снимка (файл на сървъра) — при debug=1, snapshot=1 или когато страницата е изпразнена
+    let snapshotId = null;
+    if (opts.debug || opts.snapshot || S.blanked) {
+      try {
+        snapshotId = newSnapshotId(url);
+        const L = [];
+        L.push('FSS deep-visit snapshot ' + snapshotId, 'time: ' + new Date().toISOString(), 'version: ' + WORKER_VERSION, 'url: ' + url,
+          'verdict: ' + verdict + '  level: ' + level + '  score: ' + score + '  label: ' + label + '  confidence: ' + confidence,
+          'blanked: ' + S.blanked + (S.blank ? ' (' + S.blank.kind + ' at ' + S.blank.at_ms + 'ms)' : '') + '  likely_cause: ' + likelyCause,
+          'environment: ' + JSON.stringify({ engine: ENGINE, browser_mode: browserMode, mobile: isMobile, quiet_console: quiet, antidebug_block: BLOCK_ANTIDEBUG }), '');
+        L.push('== ATTEMPTS ==', JSON.stringify(S.attempts, null, 1), '');
+        L.push('== NAVIGATION TIMELINE (main frame) ==');
+        for (const n of S.nav) L.push('+' + String(n.t).padStart(6) + 'ms  [r' + n.round + '/' + n.profile + ']  ' + (n.event || '') + (n.url || ''));
+        L.push('', '== PAGE ERRORS ==');
+        for (const e of S.pageErrors) L.push('+' + e.t + 'ms [r' + e.round + '/' + e.profile + '] ' + e.msg);
+        L.push('', '== CONSOLE (warn/error) ==');
+        for (const e of S.consoleMsgs) L.push('+' + e.t + 'ms [r' + e.round + '/' + e.profile + '] ' + e.type + ': ' + e.msg);
+        L.push('', '== ANTI-DEBUG SCRIPTS BLOCKED BY US ==', ...S.antiBlocked);
+        L.push('', '== SCRIPTS WITH FLAGS / STUB RESPONSES ==');
+        for (const x of S.scriptScan) L.push('[r' + x.round + '/' + x.profile + '] ' + x.host + x.path + ' bytes=' + x.bytes + ' third_party=' + x.third_party + ' flags=' + x.flags.join(',') + (x.stub ? ' STUB' : '') + (x.snippet ? '\n    ...' + x.snippet : ''));
+        L.push('', '== STATIC SCAN ==', JSON.stringify(staticScan, null, 1));
+        L.push('', '== EXTERNAL SCRIPT HOSTS ==', Array.from(S.externalScripts).join(', '));
+        L.push('', '== MAIN DOCUMENTS (raw HTML, first 60000 chars each) ==');
+        for (const d of S.docs) L.push('--- [r' + d.round + '/' + d.profile + '] ' + d.url + ' status=' + d.status + ' bytes=' + d.bytes + ' type=' + d.ct, (d.html || '').slice(0, 60000), '');
+        await saveSnapshot(snapshotId, L.join('\n'));
+      } catch (e) { snapshotId = null; }
+    }
 
     const totalAdHits = Array.from(S.adHosts.values()).reduce((a, b) => a + b, 0);
     const adDomainBreakdown = {};
@@ -1347,7 +1818,7 @@ async function analyze(rawUrl, opts) {
       suspicious_overlays: S.overlays, clicks: S.clickLog.length, click_log: S.clickLog,
       popups, hijacks: S.hijackUrls.length, js_runtime_hooks_triggered: uniqueJsOpens,
       network_redirects_triggered: uniqueRedirects, ad_domain_hits: totalAdHits,
-      unique_ad_hosts: S.adHosts.size, unique_tracker_hosts: S.trackerHosts.size,
+      unique_ad_hosts: adSet2.size, unique_tracker_hosts: S.trackerHosts.size,
       ad_domains: Object.keys(adDomainBreakdown), ad_domain_breakdown: adDomainBreakdown,
       tracker_domains: Array.from(S.trackerHosts.keys()).slice(0, 20),
       external_script_hosts: Array.from(S.externalScripts).slice(0, 25),
@@ -1356,14 +1827,18 @@ async function analyze(rawUrl, opts) {
       player_clicked: S.playerClicked, player_url: S.playerUrl, deep: !!opts.deep,
       blocklist_domains: AD_SET.size + TRACKER_SET.size + AD_DOMAINS.length,
       bad_events: S.hijackUrls.length + popups + uniqueJsOpens, ad_score: score, ad_level: level,
-      score_breakdown: breakdown, popunder_networks: Array.from(S.popunderHosts.keys()),
+      score_breakdown: breakdown, popunder_networks: Array.from(popSet),
+      label, label_confidence: confidence, score_basis: scoreBasis, risk_flags: riskFlags, lure_urls: lureUrls, stub_hosts: stubHosts,
       ad_responses: S.adResponses, inconclusive, confidence, verdict, test_notes: notes,
       environment: {
+        engine: ENGINE, quiet_console: quiet, antidebug_block: BLOCK_ANTIDEBUG,
         browser_mode: browserMode, headless: !HEADFUL, proxy: !!PROXY, mobile: isMobile,
         user_agent: ua, rounds_planned: maxRounds, locale: lang, timezone: tzId || 'server_default',
         dwell_sec: opts.dwell || 0, returning_visitor_round2: !!opts.returning,
       },
       rounds: roundsInfo, debug: opts.debug ? S.debug : undefined,
+      diagnostics, static_scan: staticScan, snapshot_id: snapshotId,
+      snapshot_hint: snapshotId ? '/snapshot?id=' + snapshotId + '&key=YOUR_KEY' : null,
       evidence: {
         popup_urls: popupUrls.slice(0, 10),
         popup_details: S.popupRecords.slice(0, 10).map((r) => ({ phase: r.phase, round: r.round, urls: r.urls.slice(0, 6) })),
@@ -1387,7 +1862,23 @@ function buildApp() {
     blocklist_domains: AD_SET.size + TRACKER_SET.size + AD_DOMAINS.length,
     blocklist_ads: AD_SET.size, blocklist_trackers: TRACKER_SET.size, blocklist_allow: ALLOW_SET.size,
     blocklist_ready: blocklistReady, blocklist_sources: blocklistStatus,
+    engine: ENGINE, quiet_console_default: QUIET_CONSOLE_DEFAULT, antidebug_block: BLOCK_ANTIDEBUG,
+    snapshots_dir: SNAP_DIR, snapshots_keep: SNAP_KEEP,
+    stats: { ...STATS, uptime_min: Math.round((Date.now() - STATS.started) / 60000) },
   }));
+  app.get('/snapshots', auth, async (_req, res) => {
+    res.json({ success: true, dir: SNAP_DIR, snapshots: await listSnapshots() });
+  });
+  app.get('/snapshot', auth, async (req, res) => {
+    const id = String(req.query.id || '');
+    if (!/^[0-9a-z-]{8,60}$/.test(id)) return res.status(400).type('text/plain').send('Bad id');
+    try {
+      const txt = await fs.promises.readFile(path.join(SNAP_DIR, id + '.txt'), 'utf8');
+      res.type('text/plain; charset=utf-8').send(txt);
+    } catch (_) {
+      res.status(404).type('text/plain').send('Snapshot not found (може да е изтрита — пазят се само последните ' + SNAP_KEEP + ')');
+    }
+  });
   app.get('/deep-check', auth, async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ success: false, error: 'Missing URL' });
@@ -1402,13 +1893,20 @@ function buildApp() {
     const tz = /^[A-Za-z_]+(\/[A-Za-z_+-]+){0,2}$/.test(String(req.query.tz || '')) ? String(req.query.tz) : '';
     const dwell = Math.min(40, Math.max(0, parseFloat(req.query.dwell || '0') || 0));
     const returning = req.query.returning === '1';
+    const quiet = req.query.quiet === '0' ? false : (req.query.quiet === '1' ? true : null);   // null = по подразбиране от .env
+    const snapshot = req.query.snapshot === '1';
+    const stat = req.query.static === '0' ? false : true;
     try {
       const result = await runLimited(() => analyze(String(url), {
         clicks, waitMs: Math.round(waitSec * 1000), mobile, deep, rounds, playUrl, debug, locale, tz, dwell, returning,
+        quiet, snapshot, static: stat,
       }));
+      recordStats(result);
       res.json(result);
     } catch (e) {
-      res.json({ success: false, error: e.message });
+      const result = { success: false, error: e.message };
+      recordStats(result);
+      res.json(result);
     }
   });
   return app;
@@ -1431,7 +1929,8 @@ if (require.main === module) {
   });
 }
 
-module.exports = { 
+module.exports = {
+  scanScriptText, staticScanHtml, STUB_RE, LURE_RE, POPUNDER_PATH_RE, listSnapshots,
   popunderMatchHost, analyze, buildApp, parseListLine, adMatchHost, trackerMatchHost, 
   hostAllowed, assertSafeUrl, looksLikeDga, getRootDomain, AD_SET, TRACKER_SET, ALLOW_SET, isPrivateIp 
 };
