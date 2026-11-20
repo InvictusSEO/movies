@@ -1,4 +1,4 @@
-// deep-visit.js — FSS Deep Visit Worker v5.1
+// deep-visit.js — FSS Deep Visit Worker v5.2
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
 
 const express = require('express');
@@ -19,7 +19,7 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5.1';
+const WORKER_VERSION = 'v5.2';
 const DEFAULT_LOCALE = process.env.DEEP_VISIT_LOCALE || 'en-US';
 const DEFAULT_TZ = process.env.DEEP_VISIT_TZ || '';
 
@@ -454,12 +454,18 @@ function hookScript(bindName) {
       }
     } catch (_) {}
 
-    // Блокиране на пренасочване към about:blank от anti-bot скриптове
+    // Блокиране на anti-bot затваряне на страницата или бягство в about:blank
     try {
+      window.close = function() {};
       const origReplace = window.location.replace;
       window.location.replace = function(url) {
-        if (String(url) === 'about:blank') return;
+        if (!url || String(url).startsWith('about:')) return;
         return origReplace.apply(this, arguments);
+      };
+      const origAssign = window.location.assign;
+      window.location.assign = function(url) {
+        if (!url || String(url).startsWith('about:')) return;
+        return origAssign.apply(this, arguments);
       };
     } catch (_) {}
 
@@ -540,7 +546,8 @@ function hookScript(bindName) {
 // Основен анализ
 // ---------------------------------------------------------------------------------------------
 const CF_RE = /just a moment|verifying you are human|verify you are human|checking your browser|attention required/i;
-const PLAYER_SEL = 'video, iframe, [id*="player" i], [class*="player" i], [class*="jwplayer"], [class*="video-js"], [class*="plyr"], [class*="dplayer"], [id*="video" i]';
+// Фикс: Разширен PLAYER_SEL за по-модерни контейнери
+const PLAYER_SEL = 'video, iframe, [id*="player" i], [class*="player" i], [class*="embed" i], [id*="embed" i], [class*="stream" i], [class*="jwplayer"], [class*="video-js"], [class*="plyr"], [class*="dplayer"], [class*="artplayer"], [id*="video" i]';
 const PLAY_SEL = 'a, button, [role="button"], [class*="play"], [class*="watch"], [class*="btn"]';
 const FILTER_SEL = 'a, button, [role="button"], .play, [class*="play"], [class*="poster"], [class*="card"]';
 
@@ -625,7 +632,7 @@ async function analyze(rawUrl, opts) {
         try {
           const u = new URL(route.request().url());
           // Фикс: Блокиране на anti-devtool / anti-automation скриптове
-          if (/disable-devtool|devtools-detect/i.test(u.pathname) || /disable-devtool|devtools-detect/i.test(u.hostname)) {
+          if (/disable-devtool|devtools-detect|console-ban|fuck-devtools/i.test(u.href)) {
             return route.abort('blockedbyclient');
           }
           if (u.protocol === 'http:' || u.protocol === 'https:') {
@@ -735,7 +742,7 @@ async function analyze(rawUrl, opts) {
               
               // Фикс: Засичане на Monetag popunder отговор "// mt"
               if (b.length <= 20 && /^\/\/\s*mt\b/i.test(b.toString('utf8').trim())) {
-                bump(S.popunderHosts, host);
+                bump(S.popunderHosts, getRootDomain(host));
               }
             } catch (_) {}
           }
@@ -976,6 +983,12 @@ async function analyze(rawUrl, opts) {
               if (t.length < 40 && /(^|\s|▶)(play|watch|stream)(\s|$| now| movie| online)/.test(t)) s += 4;
               if (/btn[-_ ]?play|play[-_ ]?btn|btn[-_ ]?watch|watch[-_ ]?btn|watching/.test(cls)) s += 3;
               if (/\/watch|\/play|\/stream|watching\.html|-watch\b/.test(href)) s += 3;
+              
+              // Фикс: SVG Play бутони без текст
+              if (!t && el.querySelector('svg') && r.width >= 36 && r.width <= 140 && r.height >= 36 && r.height <= 140 && r.top > 100 && r.top < window.innerHeight * 0.85) {
+                s += 3;
+              }
+              
               if (el.closest('header, nav, footer')) s -= 3;
               if (s > bestS) bestS = s, best = { idx: i, sig: el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + t.slice(0, 30) };
             } catch (_) {}
