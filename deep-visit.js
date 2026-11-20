@@ -1,33 +1,5 @@
-// deep-visit.js — FSS Deep Visit Worker v5
+// deep-visit.js — FSS Deep Visit Worker v5.1
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
-//
-// v5 (спрямо v4):
-//  - Куките (window.open, synthetic click, form submit) се докладват веднага към Node през exposeBinding,
-//    затова не се губят при навигация между страници.
-//  - Цел: плейърът. Откриване по DOM (video / голям iframe / player контейнер), не по URL.
-//    Клик върху <video>, iframe и контейнери; до 3 клика на плейъра с различно отместване.
-//  - Празните опити (няма елемент) НЕ харчат бюджета от кликове.
-//  - Линкове към съдържание: не от меню/хедър/футър; target=_blank се сваля, за да не се брои собствен таб за popup.
-//  - Пауза ~6 сек. с движение/скрол преди първия клик (рекламните скриптове се "активират" със закъснение).
-//  - Втори рунд в НОВ чист контекст директно на намерената страница с плейър (рекламите имат лимит по бисквитки).
-//  - Параметър play_url: директен адрес на страница с плейър (препоръчително да се пази в базата).
-//  - Точкуване по УНИКАЛНИ рекламни хостове (не по заявки); реклами и тракери са разделени;
-//    DGA хевристиката е само информативна (не точкува) — изчезват фалшивите "low" за собствени CDN-и.
-//  - JS-отваряния се точкуват само над броя реални popup-и (без двойно броене).
-//  - @@ изключения и опции ($domain=, ~, redirect…) в списъците се уважават. 
-//  - Състояние "неубедителен тест": inconclusive / confidence / verdict / test_notes.
-//  - SSRF защита за ВСЯКА заявка на браузъра (частни IP, localhost, имена без точка, .local/.internal).
-//  - Новият headless режим (по-малко разпознаваем) с автоматично връщане към стария, ако не стартира.
-//  - В отговора: environment (headless, proxy, ua) и rounds.
-//  - Съвместимо с v4: всички стари полета са налични.
-//
-// ENV: DEEP_VISIT_PORT, DEEP_VISIT_KEY, DEEP_VISIT_MAX_CONCURRENT, DEEP_VISIT_PROXY (по избор),
-//      DEEP_VISIT_HEADFUL=1 (иска xvfb), DEEP_VISIT_NEW_HEADLESS=0 (изключва новия headless),
-//      DEEP_VISIT_ROUNDS (по подразбиране 2), DEEP_VISIT_UA, DEEP_VISIT_EXECUTABLE,
-//      DEEP_VISIT_ALLOW_QUERY_KEY=0 (приема ключ само в хедър x-api-key), DEEP_VISIT_EXTRA_ARGS (през запетая).
-//
-// API: GET /deep-check?url=...&clicks=6&wait=2.5&mobile=0|1&deep=1|0&rounds=1..3&play_url=...&debug=1
-//      експерименти: &locale=bg-BG &tz=Europe/Sofia &dwell=20 (секунди чакане преди първия клик) &returning=1 (рунд 2 със запазени бисквитки)
 
 const express = require('express');
 const crypto = require('crypto');
@@ -47,7 +19,7 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5';
+const WORKER_VERSION = 'v5.1';
 const DEFAULT_LOCALE = process.env.DEEP_VISIT_LOCALE || 'en-US';
 const DEFAULT_TZ = process.env.DEEP_VISIT_TZ || '';
 
@@ -91,10 +63,9 @@ const AD_DOMAINS = [
   'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
   'diketime.com','bytogeticr.com','vebo-vast.com','adoto.net','proftrafficcounter.com',
   'wpadmngr.com','nawpush.com','capndr.com','ntvpforever.com','cabnnr.com','metricswpsh.com',
-  'uuidksinc.net','new-programmatic.com','liftdsp.com'
+  'uuidksinc.net','new-programmatic.com','liftdsp.com','whfcutler.com'
 ];
 
-// Мрежи, чийто основен продукт са popunder / onclick / push реклами.
 const POPUNDER_DOMAINS = [
   'popads.net','popcash.net','propellerads.com','propellerpops.com','onclickalgo.com','onclickmax.com',
   'onclckds.com','onclckpro.com','onclckstr.com','onclckinp.com','onclckmetrics.com',
@@ -107,7 +78,7 @@ const POPUNDER_DOMAINS = [
   'chooxaur.com','gloaphoo.net','phaurtuh.net','thaudray.com','whephoochi.com','zaubanel.com',
   'ptauxofi.net','jouteetu.net','loukoost.net','phicmune.net','toapoabu.net','zugnogne.com',
   'diketime.com','bytogeticr.com','wpadmngr.com','nawpush.com','capndr.com','ntvpforever.com',
-  'cabnnr.com','metricswpsh.com','uuidksinc.net'
+  'cabnnr.com','metricswpsh.com','uuidksinc.net','whfcutler.com'
 ];
 
 const LEGIT_CDNS = [
@@ -473,6 +444,25 @@ async function syncClientHints(p, ua, isMobile, fullVer, lang) {
 
 function hookScript(bindName) {
   try {
+    // Фикс: Заобикаляне на anti-automation проверки за размер на прозореца
+    try {
+      if (!window.outerWidth || window.outerWidth === 0) {
+        Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1920 });
+      }
+      if (!window.outerHeight || window.outerHeight === 0) {
+        Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 1080) + 85 });
+      }
+    } catch (_) {}
+
+    // Блокиране на пренасочване към about:blank от anti-bot скриптове
+    try {
+      const origReplace = window.location.replace;
+      window.location.replace = function(url) {
+        if (String(url) === 'about:blank') return;
+        return origReplace.apply(this, arguments);
+      };
+    } catch (_) {}
+
     const nativeToString = Function.prototype.toString;
     const mask = new WeakMap();
     const toStringWrapper = function toString() {
@@ -634,6 +624,10 @@ async function analyze(rawUrl, opts) {
       await context.route('**/*', async (route) => {
         try {
           const u = new URL(route.request().url());
+          // Фикс: Блокиране на anti-devtool / anti-automation скриптове
+          if (/disable-devtool|devtools-detect/i.test(u.pathname) || /disable-devtool|devtools-detect/i.test(u.hostname)) {
+            return route.abort('blockedbyclient');
+          }
           if (u.protocol === 'http:' || u.protocol === 'https:') {
             if (!(await hostAllowed(u.hostname))) return route.abort('blockedbyclient');
           } else if (!/^(data|blob|about|ws|wss):$/.test(u.protocol)) {
@@ -729,7 +723,8 @@ async function analyze(rawUrl, opts) {
       context.on('response', async (res) => {
         try {
           const ru = new URL(res.url());
-          if (S.adResponses.length < 16 && adMatchHost(ru.hostname.toLowerCase())) {
+          const host = ru.hostname.toLowerCase();
+          if (S.adResponses.length < 16 && adMatchHost(host)) {
             const h = res.headers();
             const entry = { round: idx + 1, host: ru.hostname, path: (ru.pathname + ru.search).slice(0, 60), status: res.status(), type: String(h['content-type'] || '').slice(0, 40), len: h['content-length'] || null, bytes: null, snippet: null, set_cookie: !!h['set-cookie'] };
             S.adResponses.push(entry);
@@ -737,6 +732,11 @@ async function analyze(rawUrl, opts) {
               const b = await res.body();
               entry.bytes = b.length;
               entry.snippet = b.toString('utf8', 0, 160).replace(/\s+/g, ' ');
+              
+              // Фикс: Засичане на Monetag popunder отговор "// mt"
+              if (b.length <= 20 && /^\/\/\s*mt\b/i.test(b.toString('utf8').trim())) {
+                bump(S.popunderHosts, host);
+              }
             } catch (_) {}
           }
         } catch (_) {}
@@ -1021,7 +1021,6 @@ async function analyze(rawUrl, opts) {
           }
           if (bestS >= 2) return best;
 
-          // Фикс 1: Търсене на кликаеми React/Next.js картички (div/article/li с img и cursor: pointer)
           const cards = Array.from(document.querySelectorAll('div, article, li'));
           for (let i = 0; i < cards.length; i++) {
             try {
@@ -1095,7 +1094,6 @@ async function analyze(rawUrl, opts) {
           for (let i = 0; i < els.length; i++) {
             try {
               const el = els[i];
-              // Фикс 2: Игнориране на навигация, хедър, футър и горните 80px
               if (el.closest('nav, header, footer, [role="navigation"], [role="banner"], [class~="menu"], [class~="navbar"], [class~="nav"]')) continue;
               const href = el.getAttribute('href') || '';
               if (/^(mailto|tel|javascript):/i.test(href)) continue;
@@ -1108,7 +1106,7 @@ async function analyze(rawUrl, opts) {
               const cls = String(el.className || '');
               if (/share|social|login|register|bookmark/i.test(cls)) continue;
               const r = el.getBoundingClientRect();
-              if (r.top < 80 && r.height < 80) continue; // Допълнителна защита за top nav
+              if (r.top < 80 && r.height < 80) continue;
               if (r.width < 25 || r.height < 20) continue;
               if (r.right <= 0 || r.left >= window.innerWidth) continue;
               const sig = el.tagName + '|' + href + '|' + cls.slice(0, 60) + '|' + (el.innerText || '').trim().slice(0, 30);
