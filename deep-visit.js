@@ -1,4 +1,4 @@
-// deep-visit.js — FSS Deep Visit Worker v5.2
+// deep-visit.js — FSS Deep Visit Worker v5.3
 // Node 18+; deps: express, playwright, playwright-extra, puppeteer-extra-plugin-stealth
 
 const express = require('express');
@@ -19,7 +19,7 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5.2';
+const WORKER_VERSION = 'v5.3';
 const DEFAULT_LOCALE = process.env.DEEP_VISIT_LOCALE || 'en-US';
 const DEFAULT_TZ = process.env.DEEP_VISIT_TZ || '';
 
@@ -444,6 +444,15 @@ async function syncClientHints(p, ua, isMobile, fullVer, lang) {
 
 function hookScript(bindName) {
   try {
+    // Фикс: Неутрализиране на debugger капаните на anti-devtool скриптовете
+    try {
+      const origConstructor = Function.prototype.constructor;
+      Function.prototype.constructor = function(str) {
+        if (typeof str === 'string' && str.trim() === 'debugger') return function() {};
+        return origConstructor.apply(this, arguments);
+      };
+    } catch (_) {}
+
     // Фикс: Заобикаляне на anti-automation проверки за размер на прозореца
     try {
       if (!window.outerWidth || window.outerWidth === 0) {
@@ -630,7 +639,18 @@ async function analyze(rawUrl, opts) {
     try {
       await context.route('**/*', async (route) => {
         try {
-          const u = new URL(route.request().url());
+          const req = route.request();
+          
+          // Фикс v5.3: Спиране на бягството в about:blank на ниво Navigation Request
+          if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+            const navUrl = req.url();
+            if (navUrl.startsWith('about:')) {
+              return route.abort('blockedbyclient');
+            }
+          }
+
+          const u = new URL(req.url());
+          
           // Фикс: Блокиране на anti-devtool / anti-automation скриптове
           if (/disable-devtool|devtools-detect|console-ban|fuck-devtools/i.test(u.href)) {
             return route.abort('blockedbyclient');
