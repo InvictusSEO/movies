@@ -36,7 +36,7 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5.5';
+const WORKER_VERSION = 'v5.6';
 const QUIET_CONSOLE_DEFAULT = process.env.DEEP_VISIT_QUIET_CONSOLE !== '0';   // заглушава console.* срещу anti-devtool капани
 const BLOCK_ANTIDEBUG = process.env.DEEP_VISIT_BLOCK_ANTIDEBUG !== '0';        // блокира известни anti-devtool скриптове
 const SNAP_DIR = process.env.DEEP_VISIT_SNAPSHOT_DIR || path.join(os.tmpdir(), 'fss-snapshots');
@@ -1737,7 +1737,7 @@ async function analyze(rawUrl, opts) {
     if (S.loaded && !S.playerClicked) notes.push('player_not_reached');
     if (S.overlays > 0 && !hasAdEvidence) notes.push('overlay_ignored_no_ads_detected');
     if (staticScan && staticScan.player_hint && !S.playerFound) notes.push('static_scan_sees_player_hint');
-    const silentAds = S.playerClicked && popups === 0 && S.hijackUrls.length === 0 && adSet2.size > 0;
+    const silentAds = S.playerClicked && popups === 0 && S.hijackUrls.length === 0 && (adSet2.size > 0 || popSet.size > 0);
     if (silentAds) notes.push('ad_scripts_loaded_but_no_activity_environment_may_suppress_them');
 
     let confidence = 'high';
@@ -1761,7 +1761,8 @@ async function analyze(rawUrl, opts) {
     let usable = true, usableReason = 'ok';
     if (confidence === 'none') { usable = false; usableReason = S.cfChallenge ? 'cloudflare_challenge' : (S.blanked ? 'page_blanked_by_site' : 'page_not_loaded'); }
     else if (inconclusive) { usable = false; usableReason = 'inconclusive'; }
-    else if (!S.playerClicked) { usable = false; usableReason = 'player_not_reached'; }
+    else if (!S.playerClicked && !(popups > 0 || S.hijackUrls.length > 0 || S.downloads > 0)) { usable = false; usableReason = 'player_not_reached'; }
+    const lowerBoundOnly = usable && !S.playerClicked;
     const labelNote = scoreBasis === 'ad_scripts_only'
       ? 'Ad networks are present but no popups were observed from our test server; real visitors may see more.'
       : (scoreBasis === 'observed_behaviour' ? 'Based on behaviour observed during the test.' : 'No ad activity found.');
@@ -1833,14 +1834,14 @@ async function analyze(rawUrl, opts) {
       unique_ad_hosts: adSet2.size, unique_tracker_hosts: S.trackerHosts.size,
       ad_domains: Object.keys(adDomainBreakdown), ad_domain_breakdown: adDomainBreakdown,
       tracker_domains: Array.from(S.trackerHosts.keys()).slice(0, 20),
-      external_script_hosts: Array.from(S.externalScripts).slice(0, 25),
+      external_script_hosts: Array.from(S.externalScripts).filter((h) => /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(String(h)) && h !== 'undefined').slice(0, 25),
       suspicious_script_hosts: Array.from(S.unknownHosts).slice(0, 15),
       downloads: S.downloads, detail_page_reached: S.detailReached, player_found: S.playerFound,
       player_clicked: S.playerClicked, player_url: S.playerUrl, deep: !!opts.deep,
       blocklist_domains: AD_SET.size + TRACKER_SET.size + AD_DOMAINS.length,
       bad_events: S.hijackUrls.length + popups + uniqueJsOpens, ad_score: score, ad_level: level,
       score_breakdown: breakdown, popunder_networks: Array.from(popSet),
-      label, label_confidence: confidence, label_note: labelNote, usable_for_score: usable, usable_reason: usableReason, score_basis: scoreBasis, risk_flags: riskFlags, lure_urls: lureUrls, stub_hosts: stubHosts,
+      label, label_confidence: confidence, label_note: lowerBoundOnly ? 'Player was not reached, but bad behaviour was observed. The real picture is at least this bad.' : labelNote, lower_bound_only: lowerBoundOnly, usable_for_score: usable, usable_reason: usableReason, score_basis: scoreBasis, risk_flags: riskFlags, lure_urls: lureUrls, stub_hosts: stubHosts,
       ad_responses: S.adResponses, inconclusive, confidence, verdict, test_notes: notes,
       environment: {
         engine: ENGINE, quiet_console: quiet, antidebug_block: BLOCK_ANTIDEBUG,
