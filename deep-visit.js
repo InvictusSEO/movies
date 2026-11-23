@@ -28,7 +28,7 @@ if (!chromium) {
 
 const PORT = process.env.DEEP_VISIT_PORT || 3001;
 const API_KEY = process.env.DEEP_VISIT_KEY || '';
-const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DEEP_VISIT_MAX_CONCURRENT || '2', 10));
+const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DEEP_VISIT_MAX_CONCURRENT || '1', 10));
 const PROXY = process.env.DEEP_VISIT_PROXY || '';
 const HEADFUL = process.env.DEEP_VISIT_HEADFUL === '1';
 const NEW_HEADLESS = process.env.DEEP_VISIT_NEW_HEADLESS !== '0';
@@ -36,7 +36,7 @@ const DEFAULT_ROUNDS = Math.min(3, Math.max(1, parseInt(process.env.DEEP_VISIT_R
 const ALLOW_QUERY_KEY = process.env.DEEP_VISIT_ALLOW_QUERY_KEY !== '0';
 const EXTRA_ARGS = (process.env.DEEP_VISIT_EXTRA_ARGS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const BLOCKLIST_TTL_MS = 24 * 3600 * 1000;
-const WORKER_VERSION = 'v5.4';
+const WORKER_VERSION = 'v5.5';
 const QUIET_CONSOLE_DEFAULT = process.env.DEEP_VISIT_QUIET_CONSOLE !== '0';   // заглушава console.* срещу anti-devtool капани
 const BLOCK_ANTIDEBUG = process.env.DEEP_VISIT_BLOCK_ANTIDEBUG !== '0';        // блокира известни anti-devtool скриптове
 const SNAP_DIR = process.env.DEEP_VISIT_SNAPSHOT_DIR || path.join(os.tmpdir(), 'fss-snapshots');
@@ -1293,10 +1293,10 @@ async function analyze(rawUrl, opts) {
       }
 
       async function findPlayButton() {
-        const pick = await page.evaluate(({ sel, roots }) => {
+        const pick = await page.evaluate(({ sel, roots, multi }) => {
           const els = Array.from(document.querySelectorAll(sel));
           let best = null, bestS = 0;
-          const rootOf = (h) => h.toLowerCase().split('.').slice(-2).join('.');
+          const rootOf = (h) => { const p = h.toLowerCase().split('.').filter(Boolean); if (p.length <= 2) return p.join('.'); const t = p.slice(-2).join('.'); return multi.indexOf(t) !== -1 ? p.slice(-3).join('.') : t; };
           for (let i = 0; i < els.length; i++) {
             try {
               const el = els[i];
@@ -1323,7 +1323,7 @@ async function analyze(rawUrl, opts) {
             } catch (_) {}
           }
           return bestS >= 3 ? best : null;
-        }, { sel: PLAY_SEL, roots: Array.from(S.siteRoots) }).catch(() => null);
+        }, { sel: PLAY_SEL, roots: Array.from(S.siteRoots), multi: Array.from(MULTI_TLDS) }).catch(() => null);
         if (!pick || clickedSigs.has(pick.sig)) return null;
         const h = (await page.$$(PLAY_SEL))[pick.idx];
         if (!h) return null;
@@ -1333,10 +1333,10 @@ async function analyze(rawUrl, opts) {
 
       async function findContentLink() {
         const cur = page.url();
-        const pick = await page.evaluate(({ roots, cur }) => {
+        const pick = await page.evaluate(({ roots, cur, multi }) => {
           const bad = /\/(genre|genres|country|login|register|signin|signup|filter|search|tag|tags|actor|actors|director|year|type|page|privacy|terms|dmca|contact|about|faq|category|categories|az-list|a-z|top-imdb|most-popular|upcoming|release|schedule|news|blog)(\/|$|\.)/i;
           const good = /(movie|movies|film|watch|series|tv|episode|anime|drama|show|video|stream|play|detail|vod|title|info|season)/i;
-          const rootOf = (h) => h.toLowerCase().split('.').slice(-2).join('.');
+          const rootOf = (h) => { const p = h.toLowerCase().split('.').filter(Boolean); if (p.length <= 2) return p.join('.'); const t = p.slice(-2).join('.'); return multi.indexOf(t) !== -1 ? p.slice(-3).join('.') : t; };
           const as = Array.from(document.querySelectorAll('a[href]'));
           let best = null, bestS = 0;
           for (let i = 0; i < as.length; i++) {
@@ -1382,7 +1382,7 @@ async function analyze(rawUrl, opts) {
             } catch (_) {}
           }
           return null;
-        }, { roots: Array.from(S.siteRoots), cur }).catch(() => null);
+        }, { roots: Array.from(S.siteRoots), cur, multi: Array.from(MULTI_TLDS) }).catch(() => null);
 
         if (!pick || clickedSigs.has(pick.sig)) return null;
 
@@ -1677,7 +1677,10 @@ async function analyze(rawUrl, opts) {
       seenRed.add(k);
       return true;
     });
-    const adRedirects = dedupRed.filter((x) => x.src === 'page' && (adDomainMatch(x.to) || adDomainMatch(x.from)));
+    const BENIGN_REDIRECT_RE = /\/pagead\/id|\/instream\/ad_status|\/ccm\/collect|\/pagead\/viewthroughconversion/i;
+    const adRedirects = dedupRed.filter((x) => x.src === 'page' && (adDomainMatch(x.to) || adDomainMatch(x.from))
+      && rootOfUrl(x.from) !== rootOfUrl(x.to)           // пренасочване в рамките на една и съща мрежа (напр. синхронизация на Google)
+      && !BENIGN_REDIRECT_RE.test(x.from) && !BENIGN_REDIRECT_RE.test(x.to));
     const uniqueRedirects = new Set(adRedirects.map((x) => x.to)).size;
 
     const stubHosts = Array.from(S.stubHosts.keys());
@@ -1754,6 +1757,15 @@ async function analyze(rawUrl, opts) {
     let label = { none: 'Clean', low: 'Light', medium: 'Moderate', high: 'Aggressive' }[level];
     if (confidence === 'none' || (inconclusive && (level === 'none' || level === 'low'))) label = 'Unknown';
 
+    // Дали резултатът е достатъчно надежден, за да влезе в оценката на сайта (за интеграцията в директорията)
+    let usable = true, usableReason = 'ok';
+    if (confidence === 'none') { usable = false; usableReason = S.cfChallenge ? 'cloudflare_challenge' : (S.blanked ? 'page_blanked_by_site' : 'page_not_loaded'); }
+    else if (inconclusive) { usable = false; usableReason = 'inconclusive'; }
+    else if (!S.playerClicked) { usable = false; usableReason = 'player_not_reached'; }
+    const labelNote = scoreBasis === 'ad_scripts_only'
+      ? 'Ad networks are present but no popups were observed from our test server; real visitors may see more.'
+      : (scoreBasis === 'observed_behaviour' ? 'Based on behaviour observed during the test.' : 'No ad activity found.');
+
     // Диагностика: защо страницата е станала празна (най-вероятна причина по наличните данни)
     const sus = S.scriptScan.filter((x) => x.flags.length);
     let likelyCause = null;
@@ -1828,7 +1840,7 @@ async function analyze(rawUrl, opts) {
       blocklist_domains: AD_SET.size + TRACKER_SET.size + AD_DOMAINS.length,
       bad_events: S.hijackUrls.length + popups + uniqueJsOpens, ad_score: score, ad_level: level,
       score_breakdown: breakdown, popunder_networks: Array.from(popSet),
-      label, label_confidence: confidence, score_basis: scoreBasis, risk_flags: riskFlags, lure_urls: lureUrls, stub_hosts: stubHosts,
+      label, label_confidence: confidence, label_note: labelNote, usable_for_score: usable, usable_reason: usableReason, score_basis: scoreBasis, risk_flags: riskFlags, lure_urls: lureUrls, stub_hosts: stubHosts,
       ad_responses: S.adResponses, inconclusive, confidence, verdict, test_notes: notes,
       environment: {
         engine: ENGINE, quiet_console: quiet, antidebug_block: BLOCK_ANTIDEBUG,
